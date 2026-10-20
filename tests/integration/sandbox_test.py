@@ -206,7 +206,7 @@ def setup(dll):
               LOCAL + "/Placeholder (2000)/Placeholder (2000).mkv"]:  # an empty library gets no root item
         make_video(p)
     sh("docker", "restart", "-t", "30", NAME)  # load the plugin copied in after the first start
-    ip = sh("docker", "inspect", NAME, "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}")
+    ip = sh("docker", "inspect", NAME, "--format", '{{(index .NetworkSettings.Networks "bridge").IPAddress}}')  # it is on two networks
     base = "http://%s:8096" % ip
     wait_for("server answers", lambda: _public_ok(), timeout=120)
     api("POST", "/Startup/Configuration", {"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"}, auth=False)
