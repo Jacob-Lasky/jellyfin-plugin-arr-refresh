@@ -47,6 +47,7 @@ PLUGIN_ID = "89c19d1d-6a41-4cc3-aad3-d72b1d32039f"
 UP = MOVIES + "/Up (2009) {tmdb-14160}"  # gains an alternate version
 BRAZIL = MOVIES + "/Brazil (1985)"  # no id anywhere in its path, so no shared user-data key
 CLUE = MOVIES + "/Clue (1985)"  # deleted while an unrelated movie is added, in one request
+ALIENS = MOVIES + "/Aliens (1986) {tmdb-679}"  # holds the movie and a leftover file at the initial scan
 ANDOR = TV + "/Andor (2022) {tvdb-393189}"
 
 base = token = user_id = meili = None
@@ -183,7 +184,9 @@ def setup(dll):
               TERM + "/The Terminal (2004) {tmdb-594} [DVD].mkv",
               UP + "/Up (2009) {tmdb-14160} - 1080p.mkv",
               BRAZIL + "/Brazil (1985).mkv",
-              CLUE + "/Clue (1985).mkv"]:
+              CLUE + "/Clue (1985).mkv",
+              ALIENS + "/Aliens (1986) {tmdb-679} [Bluray-1080p].mkv",
+              ALIENS + "/leftover.mkv"]:
         make_video(p)
     sh("docker", "restart", "-t", "30", NAME)  # load the plugin copied in after the first start
     ip = sh("docker", "inspect", NAME, "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}")
@@ -205,8 +208,8 @@ def setup(dll):
         api("POST", "/Library/VirtualFolders?name=%s&collectionType=%s&paths=%s&refreshLibrary=false" % (name, ctype, path),
             {"LibraryOptions": {"EnableRealtimeMonitor": False, "PathInfos": [{"Path": path}]}}, expect=204)
     api("POST", "/Library/Refresh", expect=204)
-    wait_for("initial scan finds 6 movies and 2 episodes",
-             lambda: len(items("Movie")) == 6 and len(items("Episode")) == 2, timeout=180)
+    wait_for("initial scan finds 8 movies and 2 episodes",
+             lambda: len(items("Movie")) == 8 and len(items("Episode")) == 2, timeout=180)
     # Their full reindex once, as Tower's runs nightly, so the index exists with documents in their shape.
     api("GET", "/meilisearch/reindex", expect=200)
     wait_for("Meilisearch index built", lambda: (meili_api("GET", "/indexes/%s/stats" % MEILI_INDEX)[1] or {}).get("numberOfDocuments", 0) > 0, timeout=60)
@@ -275,23 +278,22 @@ def run():
     steps = webhook(upgrade)["Steps"]
     check("upgrade replayed: idempotent (nothing created or removed)", all(not s["Created"] and not s["Removed"] for s in steps))
 
-    # An upgrade that also deletes a leftover file Jellyfin listed as its own movie: both old items
-    # hand their collection entries to the one new file.
-    leftover = ALIEN + "/leftover.mkv"
-    make_video(leftover)
-    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": ALIEN}, "movieFile": {"path": leftover}})
-    wait_for("leftover visible", lambda: leftover in paths_of("Movie"))
+    # A folder Jellyfin's scan found holding the movie and a leftover file (Radarr never leaves that
+    # itself; it is what a hand-copied extra looks like). An upgrade deletes both and imports one file:
+    # every old item hands its collection entry to the new file.
+    old_paths = [p for p in paths_of("Movie") if p.startswith(ALIENS + "/")]
     by_path = {i["Path"]: i["Id"] for i in items("Movie")}
-    aliens = api("POST", "/Collections?name=Aliens&ids=%s,%s" % (by_path[a_new], by_path[leftover]), expect=200)[1]["Id"]
-    a_hdr = ALIEN + "/Alien (1979) {tmdb-348} [Remux-2160p][HDR].mkv"
-    make_video(a_hdr)
-    ex('rm "%s" "%s"' % (a_new, leftover))
-    webhook({"eventType": "Download", "instanceName": "Radarr", "isUpgrade": True, "movie": {"folderPath": ALIEN},
-             "movieFile": {"path": a_hdr}, "deletedFiles": [{"path": a_new}, {"path": leftover}]})
+    check("two-file folder: the scan listed both files", sorted(old_paths) == sorted([ALIENS + "/Aliens (1986) {tmdb-679} [Bluray-1080p].mkv", ALIENS + "/leftover.mkv"]))
+    aliens = api("POST", "/Collections?name=Aliens&ids=%s" % ",".join(by_path[p] for p in old_paths), expect=200)[1]["Id"]
+    a_remux = ALIENS + "/Aliens (1986) {tmdb-679} [Remux-2160p].mkv"
+    make_video(a_remux)
+    ex(" && ".join('rm "%s"' % p for p in old_paths))
+    webhook({"eventType": "Download", "instanceName": "Radarr", "isUpgrade": True, "movie": {"folderPath": ALIENS},
+             "movieFile": {"path": a_remux}, "deletedFiles": [{"path": p} for p in old_paths]})
     check("two-file upgrade: only the new file remains", wait_for("two-file upgrade visible",
-          lambda: a_hdr in paths_of("Movie") and not {a_new, leftover} & paths_of("Movie")))
+          lambda: [p for p in paths_of("Movie") if p.startswith(ALIENS + "/")] == [a_remux]))
     in_aliens = [i["Path"] for i in api("GET", "/Items?ParentId=%s&Fields=Path" % aliens, expect=200)[1]["Items"]]
-    check("two-file upgrade: collection entries carried to the new file", in_aliens == [a_hdr])
+    check("two-file upgrade: collection entries carried to the new file", in_aliens == [a_remux])
 
     # Radarr whole-movie delete: only the folder path is in the payload.
     ex('rm -r "%s"' % DUNE)
@@ -300,6 +302,8 @@ def run():
     # A delete Meilisearch accepted but did not apply: put the document back by hand. Verification
     # compares with the library and deletes it again.
     gone_doc = wait_for("dune document gone", lambda: meili_doc(dune_id) is None and {"guid": "%s-%s-%s-%s-%s" % (dune_id[:8], dune_id[8:12], dune_id[12:16], dune_id[16:20], dune_id[20:]), "name": "Dune", "type": "MediaBrowser.Controller.Entities.Movies.Movie"}, timeout=60)
+    # Past this plugin's own delete (4 s after the removal), so only verification can remove it again.
+    time.sleep(10)
     meili_api("POST", "/indexes/%s/documents?primaryKey=guid" % MEILI_INDEX, [gone_doc])
     wait_for("stale document present", lambda: meili_doc(dune_id) is not None, timeout=30)
     check("a document left behind for a deleted item is removed by verification", wait_for("stale document removed", lambda: meili_doc(dune_id) is None, timeout=240))
@@ -515,9 +519,10 @@ def run():
     # Stay down until the item's metadata refresh has finished and saved it: otherwise that refresh's
     # own ItemUpdated, arriving after Meilisearch is back, would deliver the document and hide whether
     # the failed write is ever retried.
+    # RunTimeTicks is filled by the refresh's ffprobe, network or not (12.2's DTO has no refresh date).
     def refreshed():
-        q = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,DateLastRefreshed"
-        return any(i["Path"] == seven and i.get("DateLastRefreshed") for i in api("GET", q, expect=200)[1]["Items"])
+        q = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path"
+        return any(i["Path"] == seven and i.get("RunTimeTicks") for i in api("GET", q, expect=200)[1]["Items"])
     wait_for("se7en refreshed during the outage", refreshed, timeout=120)
     time.sleep(15)
     sh("docker", "start", NAME + "-meili")
