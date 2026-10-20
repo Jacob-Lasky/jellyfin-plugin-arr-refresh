@@ -282,11 +282,16 @@ public sealed class TargetedUpdater : IDisposable
         // Existing children of the parent this step may touch: whatever is stored at the webhook's
         // paths (a renamed or deleted file, an old series folder) and at the resolved ids.
         var existing = new Dictionary<Guid, BaseItem>();
+        // Every item at the path, including a version linked to another movie (Merge Versions), which
+        // FindByPath hides: its file can go while its twin stays.
         foreach (var path in step.Paths.Append(target).Distinct(PathUtil.Comparer))
         {
-            if (ChildUnder(parent, _libraryManager.FindByPath(path, null)) is { } item)
+            foreach (var found in FindAllByPath(path))
             {
-                existing.TryAdd(item.Id, item);
+                if (ChildUnder(parent, found) is { } item)
+                {
+                    existing.TryAdd(item.Id, item);
+                }
             }
         }
 
@@ -307,6 +312,8 @@ public sealed class TargetedUpdater : IDisposable
             var children = _libraryManager.GetItemList(new InternalItemsQuery
             {
                 ParentId = parent.Id,
+                IncludeOwnedItems = true,
+                IncludeAlternateVersions = true,
                 DtoOptions = DtoOptions.StoredColumnsOnly,
             });
             foreach (var child in children)
@@ -343,19 +350,21 @@ public sealed class TargetedUpdater : IDisposable
     }
 
     /// <summary>
-    /// Finds any item stored at exactly this path, including the owned alternate versions that
-    /// <see cref="ILibraryManager.FindByPath"/> hides.
+    /// Finds every item stored at exactly this path, including owned and linked alternate versions,
+    /// which <see cref="ILibraryManager.FindByPath"/> hides (and of which it returns at most one).
     /// </summary>
-    private BaseItem? FindAnyByPath(string path)
-    {
-        var found = _libraryManager.GetItemList(new InternalItemsQuery
+    private IReadOnlyList<BaseItem> FindAllByPath(string path)
+        => _libraryManager.GetItemList(new InternalItemsQuery
         {
             Path = path,
             IncludeOwnedItems = true,
             IncludeAlternateVersions = true,
-            Limit = 1,
             DtoOptions = new DtoOptions(true),
         });
+
+    private BaseItem? FindAnyByPath(string path)
+    {
+        var found = FindAllByPath(path);
         return found.Count > 0 ? found[0] : null;
     }
 
@@ -529,6 +538,13 @@ public sealed class TargetedUpdater : IDisposable
 
     private void Log(string context, StepResult r)
     {
+        // Every import names its download path, which is outside every library: not worth a line each.
+        if (r.Action == StepActions.Skip)
+        {
+            _logger.LogDebug("ArrRefresh [{Context}] skipped {Target}: {Detail}", context, r.Target, r.Detail);
+            return;
+        }
+
         if (r.Outcome == StepOutcomes.Error)
         {
             _logger.LogWarning("ArrRefresh [{Context}] {Action} {Target}: {Detail}", context, r.Action, r.Target, r.Detail);

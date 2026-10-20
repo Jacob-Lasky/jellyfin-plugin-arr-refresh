@@ -24,12 +24,18 @@ public class ArrWebhookParserTests
             [
                 Movies + "/Heat (1995) {tmdb-949} [Bluray-2160p][DTS-HD MA 5.1][h265].mkv",
                 Movies + "/Heat (1995) {tmdb-949} [Bluray-1080p][AAC 5.1][h265].mkv",
+                "/data/usenet/movies/Heat.1995/heat.mkv",
             ],
             e.Paths);
         Assert.Equal(
-            [new PathReplacement(
-                Movies + "/Heat (1995) {tmdb-949} [Bluray-1080p][AAC 5.1][h265].mkv",
-                Movies + "/Heat (1995) {tmdb-949} [Bluray-2160p][DTS-HD MA 5.1][h265].mkv")],
+            [
+                new PathReplacement(
+                    Movies + "/Heat (1995) {tmdb-949} [Bluray-1080p][AAC 5.1][h265].mkv",
+                    Movies + "/Heat (1995) {tmdb-949} [Bluray-2160p][DTS-HD MA 5.1][h265].mkv"),
+                new PathReplacement(
+                    "/data/usenet/movies/Heat.1995/heat.mkv",
+                    Movies + "/Heat (1995) {tmdb-949} [Bluray-2160p][DTS-HD MA 5.1][h265].mkv"),
+            ],
             e.Replacements);
     }
 
@@ -80,8 +86,8 @@ public class ArrWebhookParserTests
         var e = ParseFixture("sonarr-download.json");
         Assert.Equal(ArrSource.Sonarr, e.Source);
         Assert.Equal(ArrEventKind.Apply, e.Kind);
-        Assert.Equal([Series + "/Season 03/Severance (2022) - S03E01 - Ep [WEBDL-2160p].mkv"], e.Paths);
-        Assert.Empty(e.Replacements);
+        Assert.Equal([Series + "/Season 03/Severance (2022) - S03E01 - Ep [WEBDL-2160p].mkv", "/data/usenet/tv/x.mkv"], e.Paths);
+        Assert.Equal([new PathReplacement("/data/usenet/tv/x.mkv", Series + "/Season 03/Severance (2022) - S03E01 - Ep [WEBDL-2160p].mkv")], e.Replacements);
     }
 
     [Fact]
@@ -138,6 +144,22 @@ public class ArrWebhookParserTests
         Assert.Equal(
             [new PathReplacement("/tv/S/Season 01/old.mkv", "/tv/S/Season 01/new.mkv"), new PathReplacement("/tv/S/Season 01/old2.mkv", "/tv/S/Season 01/new.mkv")],
             e.Replacements);
+    }
+
+    [Fact]
+    public void A_manual_import_from_inside_the_library_names_the_old_file_and_pairs_it()
+    {
+        var e = ArrWebhookParser.Parse("""{"eventType":"Download","movie":{"folderPath":"/m/Film (2018)"},"movieFile":{"path":"/m/Film (2018)/Film (2018).mkv","sourcePath":"/m/Film (2018) {imdbid-/Film.mkv"}}""");
+        Assert.Equal(["/m/Film (2018)/Film (2018).mkv", "/m/Film (2018) {imdbid-/Film.mkv"], e.Paths);
+        Assert.Equal([new PathReplacement("/m/Film (2018) {imdbid-/Film.mkv", "/m/Film (2018)/Film (2018).mkv")], e.Replacements);
+    }
+
+    [Fact]
+    public void A_source_path_equal_to_the_imported_path_adds_nothing()
+    {
+        var e = ArrWebhookParser.Parse("""{"eventType":"Download","movie":{"folderPath":"/m/A"},"movieFile":{"path":"/m/A/a.mkv","sourcePath":"/m/A/a.mkv"}}""");
+        Assert.Equal(["/m/A/a.mkv"], e.Paths);
+        Assert.Empty(e.Replacements);
     }
 
     [Fact]

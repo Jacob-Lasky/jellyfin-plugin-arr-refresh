@@ -455,6 +455,36 @@ def run():
     check("keyless rename: new path only", wait_for("keyless rename visible", lambda: b_new in paths_of("Movie") and b_old not in paths_of("Movie")))
     check("keyless rename: watch state copied", next(i for i in items("Movie") if i["Path"] == b_new)["UserData"]["Played"])
 
+    # Two copies merged as versions of one movie (Merge Versions, or Jellyfin's own merge): one copy's
+    # file is deleted. FindByPath hides a merged version, so it must be found by its path anyway.
+    vA, vB = MOVIES + "/Twin (2010)/Twin (2010).mkv", MOVIES + "/Twin (2010) {imdbid-/Twin (2010).mkv"
+    for v in (vA, vB):
+        make_video(v)
+        webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": v.rsplit("/", 1)[0]}, "movieFile": {"path": v}})
+    wait_for("twins visible", lambda: {vA, vB} <= paths_of("Movie"))
+    ids = {i["Path"]: i["Id"] for i in items("Movie")}
+    api("POST", "/Videos/MergeVersions?ids=%s,%s" % (ids[vA], ids[vB]), expect=204)
+    ex('rm -r "%s"' % vB.rsplit("/", 1)[0])
+    webhook({"eventType": "MovieFileDelete", "instanceName": "Radarr", "movie": {"folderPath": vB.rsplit("/", 1)[0]}, "movieFile": {"path": vB}})
+    def twin_rows():
+        q = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources"
+        return sorted(m["Path"] for i in api("GET", q, expect=200)[1]["Items"] if i["Path"] in (vA, vB) for m in i.get("MediaSources", []))
+    check("merged version deleted: only the surviving copy is left", wait_for("merged version gone", lambda: twin_rows() == [vA], timeout=60))
+
+    # A stray copy imported from inside the library (manual import with Move): the arr names the old
+    # file as the import's sourcePath, and the imported item inherits its watch state.
+    stray = MOVIES + "/Stray (2003) {imdbid-/Stray (2003).mkv"
+    make_video(stray)
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": stray.rsplit("/", 1)[0]}, "movieFile": {"path": stray}})
+    wait_for("stray visible", lambda: stray in paths_of("Movie"))
+    api("POST", "/UserPlayedItems/%s?userId=%s" % (next(i["Id"] for i in items("Movie") if i["Path"] == stray), user_id), expect=200)
+    placed = MOVIES + "/Stray (2003)/Stray (2003) [Bluray-1080p].mkv"
+    ex('mkdir -p "%s" && mv "%s" "%s" && rmdir "%s"' % (placed.rsplit("/", 1)[0], stray, placed, stray.rsplit("/", 1)[0]))
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": placed.rsplit("/", 1)[0]},
+             "movieFile": {"path": placed, "sourcePath": stray}})
+    check("in-library import: moved item replaces the stray one", wait_for("stray moved", lambda: placed in paths_of("Movie") and stray not in paths_of("Movie")))
+    check("in-library import: watch state carried over", next(i for i in items("Movie") if i["Path"] == placed)["UserData"]["Played"])
+
     # A movie moved to a new folder, through the on-demand endpoint: two steps, still paired.
     moved = MOVIES + "/Heat (1995) {tmdb-949} {edition-Directors Cut}"
     ex('mv "%s" "%s"' % (HEAT, moved))

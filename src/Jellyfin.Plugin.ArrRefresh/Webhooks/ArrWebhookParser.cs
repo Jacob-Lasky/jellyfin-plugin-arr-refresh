@@ -78,6 +78,7 @@ public static class ArrWebhookParser
                 AddPath(Get(root, "movieFile"), "path", paths);
                 AddEach(Get(root, "deletedFiles"), "path", paths);
                 AddUpgrades(GetPath(Get(root, "movieFile"), "path"), Get(root, "deletedFiles"), replacements);
+                AddMovedFrom(Get(root, "movieFile"), paths, replacements);
                 if (paths.Count == 0)
                 {
                     // Scoped to the one movie folder, so this fallback cannot become a library walk.
@@ -111,6 +112,7 @@ public static class ArrWebhookParser
                 AddEach(Get(root, "episodeFiles"), "path", paths);
                 AddEach(Get(root, "deletedFiles"), "path", paths);
                 AddUpgrades(GetPath(Get(root, "episodeFile"), "path"), Get(root, "deletedFiles"), replacements);
+                AddMovedFrom(Get(root, "episodeFile"), paths, replacements);
 
                 // DO NOT fall back to the series path when no file is named: that would refresh the
                 // whole series. An import with no file changes nothing worth guessing at.
@@ -189,6 +191,25 @@ public static class ArrWebhookParser
                 replacements.Add(new PathReplacement(previous, current));
             }
         }
+    }
+
+    /// <summary>
+    /// An import's <c>sourcePath</c> is where the file was taken from. Usually that is the download
+    /// folder, outside every library, and the planner skips it. When a file is imported from inside the
+    /// library (a manual import that moves a stray copy into place), it is the old item's path: name it
+    /// so that item is removed and hands its history to the imported one.
+    /// </summary>
+    private static void AddMovedFrom(JsonElement? file, List<string> paths, List<PathReplacement> replacements)
+    {
+        var source = GetPath(file, "sourcePath");
+        var imported = GetPath(file, "path");
+        if (source is null || imported is null || string.Equals(source, imported, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        paths.Add(source);
+        replacements.Add(new PathReplacement(source, imported));
     }
 
     private static void AddUpgrades(string? imported, JsonElement? deletedFiles, List<PathReplacement> replacements)
