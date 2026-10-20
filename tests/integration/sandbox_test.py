@@ -512,7 +512,14 @@ def run():
     make_video(seven)
     webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": seven.rsplit("/", 1)[0]}, "movieFile": {"path": seven}})
     wait_for("se7en visible", lambda: seven in paths_of("Movie"))
-    time.sleep(10)
+    # Stay down until the item's metadata refresh has finished and saved it: otherwise that refresh's
+    # own ItemUpdated, arriving after Meilisearch is back, would deliver the document and hide whether
+    # the failed write is ever retried.
+    def refreshed():
+        q = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,DateLastRefreshed"
+        return any(i["Path"] == seven and i.get("DateLastRefreshed") for i in api("GET", q, expect=200)[1]["Items"])
+    wait_for("se7en refreshed during the outage", refreshed, timeout=120)
+    time.sleep(15)
     sh("docker", "start", NAME + "-meili")
     wait_for("Meilisearch back", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
     seven_id = next(i["Id"] for i in items("Movie") if i["Path"] == seven)
