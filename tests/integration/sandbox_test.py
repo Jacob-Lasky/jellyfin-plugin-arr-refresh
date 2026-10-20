@@ -7,7 +7,10 @@ Starts a Jellyfin container with no bind mounts (media, config and the plugin al
 copied in with `docker cp` and written with `docker exec`), so it runs the same from a laptop, CI,
 or a container that talks to a remote Docker daemon. Then it plays the webhooks Sonarr and Radarr
 send for import, upgrade, rename, file delete and whole-item delete, and checks the library after
-each one. The container is removed at the end, pass or fail.
+each one. The containers and network are removed at the end, on every exit path: pass, fail, an
+exception, SIGTERM/SIGHUP/SIGINT (e.g. `timeout`), and SIGKILL, which a separate reaper process
+covers. A run whose reaper also died is swept by a later run: at once when its process is provably gone
+(same host and pid namespace), and after MAX_AGE when its owner cannot be judged from here.
 
 Assertions are on item types, paths, watch state and collection membership, never on names,
 because names come from TMDb/TVDb and the sandbox may or may not have network access.
@@ -16,6 +19,10 @@ import hashlib
 import io
 import json
 import os
+import re
+import select
+import signal
+import socket
 import tempfile
 import zipfile
 import subprocess
@@ -40,6 +47,53 @@ MEILI_PLUGIN_ID = "974395db-b31d-46a2-bc86-ef9aa5ac04dd"
 MEILI_PLUGIN_ZIP = ("https://github.com/arnesacnussem/jellyfin-plugin-meilisearch/releases/download/1.12.1.5/meilisearch_1.12.1.5.zip",
                     "4efd0b1c543da292a9f7c46f720cb98a")
 NAME = "arr-refresh-it-%d-%s" % (os.getpid(), uuid.uuid4().hex[:8])  # unique even for runs started in the same second
+# Every container and network a run creates carries these labels, so teardown and the stale sweep find them
+# by label rather than by name pattern.
+RUN_LABEL, OWNER_LABEL, CREATED_LABEL = "arr-refresh-it.run", "arr-refresh-it.owner", "arr-refresh-it.created"
+# A run whose owner cannot be judged from here (another host, another pid namespace, no /proc) is swept once
+# it is older than this. Six hours is GitHub's limit on a hosted job, so no CI run can still be alive past it;
+# a whole run takes minutes. A run whose owner is provably alive is never swept, however old.
+MAX_AGE = 6 * 3600
+
+
+class Gone(Exception):
+    """No live process has that pid here: none at all, or only its zombie."""
+
+
+def process_identity(pid):
+    """'<pid namespace>:<pid>:<start time>'. Raises Gone when no live process has that pid, and OSError when
+    it cannot tell (no /proc).
+
+    The namespace keeps a pid from another container sharing the daemon from being judged here, and the
+    start time keeps a reused pid from passing for the run that once had it.
+    """
+    ns = os.stat("/proc/self/ns/pid").st_ino
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            fields = f.read().rsplit(")", 1)[1].split()  # counted from field 3, after the parenthesised comm
+    except FileNotFoundError:
+        raise Gone() from None
+    if fields[0] == "Z":
+        raise Gone()  # exited; a parent (or an init) that never reaps it keeps the entry
+    return "%d:%d:%s" % (ns, pid, fields[19])  # field 22, the start time
+
+
+def proc_hides_processes():
+    """True when /proc is mounted with hidepid, so a missing entry may be another user's live process."""
+    with open("/proc/self/mountinfo") as f:
+        for line in f:
+            parts = line.split()
+            if parts[4] == "/proc" and re.search(r"\bhidepid=(?!0\b|off\b)", parts[-1]):
+                return True
+    return False
+
+
+try:
+    OWNER = "%s:%s" % (socket.gethostname(), process_identity(os.getpid()))
+except OSError:
+    OWNER = socket.gethostname() + ":unknown"  # not Linux: only the age sweep can judge this run
+LABELS = ["--label", RUN_LABEL + "=" + NAME, "--label", OWNER_LABEL + "=" + OWNER,
+          "--label", "%s=%d" % (CREATED_LABEL, time.time())]
 MOVIES, TV = "/data/media/movies", "/data/media/tv"
 HEAT = MOVIES + "/Heat (1995) {tmdb-949}"
 ALIEN = MOVIES + "/Alien (1979) {tmdb-348}"
@@ -63,6 +117,107 @@ failures = []
 
 def sh(*args, check=True):
     return subprocess.run(args, check=check, capture_output=True, text=True).stdout.strip()
+
+
+def docker_ids(kind, run):
+    """Ids of one run's containers or networks; None when Docker could not be asked, which is not 'none left'."""
+    cmd = ["docker", "ps", "-aq"] if kind == "container" else ["docker", "network", "ls", "-q"]
+    r = subprocess.run(cmd + ["--filter", "label=%s=%s" % (RUN_LABEL, run)], capture_output=True, text=True)
+    return r.stdout.split() if r.returncode == 0 else None
+
+
+def teardown(run, attempts=3):
+    """Remove one run's containers (with their anonymous /config and /cache volumes) and network.
+
+    Idempotent. Returns what is still there after the last attempt ("docker unavailable" when it could not
+    tell), so a caller can fail rather than report a clean run that left something behind.
+    """
+    left = []
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(2 * attempt)
+        # By exact name, never by a filter: these three are everything a run creates (see setup). The labels
+        # only confirm that nothing is left, and let the sweep find runs.
+        subprocess.run(["docker", "rm", "-fv", run, run + "-meili"], capture_output=True)
+        subprocess.run(["docker", "network", "rm", run + "-net"], capture_output=True)  # after its endpoints
+        containers, networks = docker_ids("container", run), docker_ids("network", run)
+        if containers is None or networks is None:
+            left = ["docker unavailable"]
+            continue
+        left = containers + networks
+        if not left:
+            return []
+    return left
+
+
+def reap():
+    """Reaper mode: block until the test process is gone, however it went, then tear its run down.
+
+    The test holds the write end of this process's stdin and nothing else does (subprocess closes inherited
+    descriptors), so EOF arrives exactly when the test exits, SIGKILL included. Own session: a signal sent
+    to the test's process group (`timeout`, Ctrl-C) does not take the reaper with it.
+    """
+    print("ready", flush=True)
+    if sys.stdin.buffer.read() == b"clean":
+        return  # the test tore its run down itself and is waiting for this process to exit
+    teardown(sys.argv[2])
+    # A `docker create` the test started just before it was killed outlives it and can land after the first
+    # pass, so look once more when any such request has had time to finish. Anything later still is a run
+    # with no owner, which the age sweep removes.
+    time.sleep(10)
+    teardown(sys.argv[2])
+
+
+def owner_status(owner):
+    """'dead' only when provably gone (same host and pid namespace, and no process with that pid and start
+    time), 'alive' only when provably running, otherwise 'unknown'."""
+    host, _, ident = owner.partition(":")
+    parts = ident.split(":")
+    if host != socket.gethostname() or len(parts) != 3 or not parts[1].isdigit():
+        return "unknown"
+    try:
+        # Judged only when this process can see itself and nothing hides other processes from it, so a
+        # missing entry means a missing process.
+        if process_identity(os.getpid()).split(":")[0] != parts[0] or proc_hides_processes():
+            return "unknown"  # another pid namespace on the same daemon: its pids mean nothing here
+    except (OSError, Gone):
+        return "unknown"
+    try:
+        return "alive" if process_identity(int(parts[1])) == ident else "dead"  # a different start: reused pid
+    except Gone:
+        return "dead"
+    except OSError:
+        return "unknown"
+
+
+def sweep_stale():
+    """Tear down earlier runs whose test is provably gone, and runs older than MAX_AGE whose owner cannot be judged.
+
+    Runs are found from networks as well as containers: an interrupted teardown can leave only the network.
+    """
+    fmt = '{{.Label "%s"}}\t{{.Label "%s"}}\t{{.Label "%s"}}' % (RUN_LABEL, OWNER_LABEL, CREATED_LABEL)
+    runs = {}
+    for cmd in (["docker", "ps", "-a"], ["docker", "network", "ls"]):
+        out = subprocess.run(cmd + ["--filter", "label=" + RUN_LABEL, "--format", fmt], capture_output=True, text=True)
+        if out.returncode:
+            print("warning: could not list earlier sandboxes:", out.stderr.strip())
+        for line in out.stdout.splitlines():
+            run, owner, created = (line.split("\t") + ["", ""])[:3]
+            runs[run] = (owner, created)
+    for run, (owner, created) in runs.items():
+        if run == NAME:
+            continue
+        status = owner_status(owner)
+        old = created.isdigit() and time.time() - int(created) > MAX_AGE
+        if status == "dead" or (status == "unknown" and old):
+            print("removing stale sandbox", run, "(its test is gone)" if status == "dead" else "(older than %d s)" % MAX_AGE)
+            left = teardown(run)
+            if left:
+                print("warning: stale sandbox %s left %s behind" % (run, ", ".join(left)))
+
+
+def on_signal(signum, _frame):
+    raise SystemExit(128 + signum)  # unwinds through main's finally, so the log is still saved
 
 
 def ex(script):
@@ -178,15 +333,18 @@ def setup(dll):
     global base, token, user_id, meili
     # Meilisearch sizes its indexing memory from the host's RAM, not the container limit, and is OOM-killed
     # under a cap unless told otherwise (Tower sets MEILI_MAX_INDEXING_MEMORY for the same reason).
-    sh("docker", "network", "create", NAME + "-net")
-    sh("docker", "run", "-d", "--name", NAME + "-meili", "--network", NAME + "-net", "--network-alias", "meili",
+    # --memory-swap equal to --memory caps RAM and swap together. A daemon without swap-limit support drops it
+    # (inspect then shows MemorySwap -1 and `docker run` warns "Memory limited without swap"); on such a host
+    # the swap cap has to come from the host itself, as Tower's memory-swap-cap script provides.
+    sh("docker", "network", "create", *LABELS, NAME + "-net")
+    sh("docker", "run", "-d", "--name", NAME + "-meili", *LABELS, "--network", NAME + "-net", "--network-alias", "meili",
        "--memory=2g", "--memory-swap=2g", "-e", "MEILI_MASTER_KEY=" + MEILI_KEY,
        "-e", "MEILI_MAX_INDEXING_MEMORY=512MiB",
        "-e", "MEILI_NO_ANALYTICS=true", "-e", "MEILI_HTTP_ADDR=0.0.0.0:7700", MEILI_IMAGE)
     sh("docker", "network", "connect", "bridge", NAME + "-meili")
     meili = meili_bridge_url()
     wait_for("Meilisearch answers", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
-    sh("docker", "create", "--name", NAME, "--user", "99:100", "--memory=2g", "--memory-swap=2g", IMAGE)
+    sh("docker", "create", "--name", NAME, *LABELS, "--user", "99:100", "--memory=2g", "--memory-swap=2g", IMAGE)
     sh("docker", "network", "connect", NAME + "-net", NAME)
     sh("docker", "cp", dll, NAME + ":/tmp/plugin.dll")
     sh("docker", "start", NAME)
@@ -635,8 +793,22 @@ def run():
 
 
 def main():
+    if sys.argv[1:2] == ["--reap"]:
+        return reap()
     dll = sys.argv[1]
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+    reaper = None
     try:
+        # The reaper is running and listening before anything is created, so no container or network ever
+        # exists without one. Started inside the try, so a signal at any point still reaches the finally.
+        reaper = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--reap", NAME], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+        if not select.select([reaper.stdout], [], [], 30)[0] or reaper.stdout.readline().strip() != b"ready":
+            reaper.kill()
+            raise SystemExit("the cleanup reaper did not start, so nothing was created")
+        reaper.stdout.close()
+        sweep_stale()
         setup(dll)
         run()
     except Exception as e:
@@ -650,9 +822,22 @@ def main():
                 f.write(out.stdout + out.stderr)
             print("full server log:", log_path)
             print("\n".join((out.stdout + out.stderr).splitlines()[-60:]))
-        subprocess.run(["docker", "rm", "-fv", NAME], capture_output=True)  # -v: the image's anonymous /config and /cache volumes
-        subprocess.run(["docker", "rm", "-fv", NAME + "-meili"], capture_output=True)
-        subprocess.run(["docker", "network", "rm", NAME + "-net"], capture_output=True)
+        left = teardown(NAME)
+        if left:
+            failures.append("teardown left %s behind" % ", ".join(left))
+            print("FAIL teardown left %s behind" % ", ".join(left))
+        if reaper:
+            try:
+                if not left:
+                    reaper.stdin.write(b"clean")  # nothing for it to do; EOF alone sends it to try again
+                reaper.stdin.close()
+            except BrokenPipeError:
+                pass  # it has already exited
+            # Waited for, so it is not left to be adopted by an init that may never reap it (a zombie per run).
+            try:
+                reaper.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                print("warning: the cleanup reaper is still running")
     print("\n%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
 
