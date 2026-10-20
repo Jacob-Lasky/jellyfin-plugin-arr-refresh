@@ -36,4 +36,6 @@ public interface ILibraryView
 /// <param name="Path">The item path.</param>
 /// <param name="Type">The item type name, for logs.</param>
 /// <param name="Name">The item name, for logs.</param>
-public sealed record FolderRef(Guid Id, string Path, string Type, string Name);
+/// <param name="Attached">It has a parent or an owner. A row a refresh saved back after its removal has neither,
+/// and is not a live folder: its path is reconciled under its real parent instead.</param>
+public sealed record FolderRef(Guid Id, string Path, string Type, string Name, bool Attached = true);

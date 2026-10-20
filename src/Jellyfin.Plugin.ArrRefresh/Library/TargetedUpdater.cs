@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -40,6 +41,20 @@ public sealed class TargetedUpdater : IDisposable
     private readonly SearchIndexSync _search;
     private readonly ILogger<TargetedUpdater> _logger;
 
+    // An item removed while Jellyfin's own metadata refresh of it is still running is written back when
+    // that refresh saves (ItemPersistenceService inserts any item it does not find), and with no parent,
+    // because removal detaches it: a row no scan ever visits again and the API never lists, but that
+    // GetItemById and so the search index still find. Jellyfin's scans hit the same race; this plugin
+    // removes items seconds after creating them, while their first refresh runs, so it hits it often.
+    // Removed ids are watched (RemovedItemSchedule says when to look) and judged by RemovedItemRule.
+    private static readonly TimeSpan MaxIdle = TimeSpan.FromHours(1);
+    private static readonly TimeSpan RetryAfter = TimeSpan.FromSeconds(30);
+
+    private readonly RemovedItemSchedule _removed = new();
+    private readonly SemaphoreSlim _wake = new(0, 1);
+    private readonly CancellationTokenSource _stopping = new();
+    private readonly Task _watcher;
+
     // One webhook at a time: a Download followed by a Rename of the same movie must not interleave.
     private readonly SemaphoreSlim _gate = new(1, 1);
 
@@ -73,6 +88,10 @@ public sealed class TargetedUpdater : IDisposable
         {
             _logger.LogWarning("ArrRefresh: BaseItem.UpdateFromResolvedItem not found in this Jellyfin build; a new alternate version of an existing movie waits for the scheduled scan");
         }
+
+        _libraryManager.ItemAdded += OnItemSaved;
+        _libraryManager.ItemUpdated += OnItemSaved;
+        _watcher = Task.Run(WatchRemovedAsync);
     }
 
     /// <summary>
@@ -94,49 +113,7 @@ public sealed class TargetedUpdater : IDisposable
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var plan = new UpdatePlanner(new JellyfinLibraryView(_libraryManager)).Plan(paths);
-
-            // Phase 1: work out every change without writing or queueing anything.
-            var entries = new List<(Diff? Diff, StepResult? Done)>(plan.Count);
-            var folderRefreshes = new List<Guid>();
-            foreach (var step in plan)
-            {
-                switch (step)
-                {
-                    case ReconcileChildStep c:
-                        entries.Add(DiffChild(c));
-                        break;
-                    case RefreshFolderStep r:
-                        folderRefreshes.Add(r.Folder.Id);
-                        entries.Add((null, new StepResult(StepActions.RefreshFolder, r.Folder.Path, StepOutcomes.Ok, [], [], [Describe(r.Folder.Type, r.Folder.Name, r.Folder.Path)], null)));
-                        break;
-                    case SkipStep s:
-                        entries.Add((null, new StepResult(StepActions.Skip, s.Path, StepOutcomes.Skipped, [], [], [], s.Reason)));
-                        break;
-                    default:
-                        throw new InvalidOperationException("Unknown plan step " + step.GetType().Name);
-                }
-            }
-
-            // Phase 2. Not cancellable: an arr that hangs up mid-commit must not leave a replacement
-            // created and the item it replaces still present, or the reverse.
-            await CommitAsync(entries.Select(e => e.Diff).OfType<Diff>().ToList(), normalizedReplacements, CancellationToken.None).ConfigureAwait(false);
-
-            // Exactly what BaseItem.ChangedExternally() queues: RefreshMetadata, then ValidateChildren
-            // of this folder only.
-            _search.Track(folderRefreshes);
-            foreach (var id in folderRefreshes)
-            {
-                QueueRefresh(id);
-            }
-
-            var results = entries.Select(e => e.Done ?? e.Diff!.ToResult()).ToList();
-            foreach (var result in results)
-            {
-                Log(context, result);
-            }
-
-            return results;
+            return await ApplyLockedAsync(paths, normalizedReplacements, context).ConfigureAwait(false);
         }
         finally
         {
@@ -145,13 +122,74 @@ public sealed class TargetedUpdater : IDisposable
     }
 
     /// <inheritdoc />
-    public void Dispose() => _gate.Dispose();
+    /// <remarks>
+    /// The gate is not disposed: a webhook still running at shutdown releases it in its finally, and a
+    /// SemaphoreSlim whose wait handle is never used holds nothing to free.
+    /// </remarks>
+    public void Dispose()
+    {
+        _libraryManager.ItemAdded -= OnItemSaved;
+        _libraryManager.ItemUpdated -= OnItemSaved;
+        _stopping.Cancel();
+
+        // Bounded: a pass in progress finishes its current item before it next checks for cancellation.
+        _watcher.Wait(TimeSpan.FromSeconds(10));
+    }
+
+    /// <summary>The body of <see cref="ApplyAsync"/>; the caller holds the gate.</summary>
+    private async Task<IReadOnlyList<StepResult>> ApplyLockedAsync(IReadOnlyList<string> paths, List<PathReplacement> normalizedReplacements, string context)
+    {
+        var plan = new UpdatePlanner(new JellyfinLibraryView(_libraryManager)).Plan(paths);
+
+        // Phase 1: work out every change without writing or queueing anything.
+        var entries = new List<(Diff? Diff, StepResult? Done)>(plan.Count);
+        var folderRefreshes = new List<Guid>();
+        foreach (var step in plan)
+        {
+            switch (step)
+            {
+                case ReconcileChildStep c:
+                    entries.Add(DiffChild(c));
+                    break;
+                case RefreshFolderStep r:
+                    folderRefreshes.Add(r.Folder.Id);
+                    entries.Add((null, new StepResult(StepActions.RefreshFolder, r.Folder.Path, StepOutcomes.Ok, [], [], [Describe(r.Folder.Type, r.Folder.Name, r.Folder.Path)], null)));
+                    break;
+                case SkipStep s:
+                    entries.Add((null, new StepResult(StepActions.Skip, s.Path, StepOutcomes.Skipped, [], [], [], s.Reason)));
+                    break;
+                default:
+                    throw new InvalidOperationException("Unknown plan step " + step.GetType().Name);
+            }
+        }
+
+        // Phase 2. Not cancellable: an arr that hangs up mid-commit must not leave a replacement
+        // created and the item it replaces still present, or the reverse.
+        await CommitAsync(entries.Select(e => e.Diff).OfType<Diff>().ToList(), normalizedReplacements, CancellationToken.None).ConfigureAwait(false);
+
+        // Exactly what BaseItem.ChangedExternally() queues: RefreshMetadata, then ValidateChildren
+        // of this folder only.
+        _search.Track(folderRefreshes);
+        foreach (var id in folderRefreshes)
+        {
+            QueueRefresh(id);
+        }
+
+        var results = entries.Select(e => e.Done ?? e.Diff!.ToResult()).ToList();
+        foreach (var result in results)
+        {
+            Log(context, result);
+        }
+
+        return results;
+    }
 
     internal static string Describe(BaseItem item) => Describe(item.GetType().Name, item.Name, item.Path);
 
     private static string Describe(string type, string? name, string? path) => $"{type} '{name}' ({path})";
 
-    private static bool OnDisk(string path) => File.Exists(path) || Directory.Exists(path);
+    private static bool OnDisk(string path) => JellyfinLibraryView.OnDisk(path);
+
 
     /// <summary>
     /// Climbs from an item to its ancestor that is a direct child of <paramref name="parent"/>.
@@ -295,9 +333,11 @@ public sealed class TargetedUpdater : IDisposable
             }
         }
 
+        // A row a refresh saved back with no parent (see _removed) is not this item: the item is
+        // created over it, which gives the row its parent again.
         foreach (var item in resolved)
         {
-            if (_libraryManager.GetItemById(item.Id) is { } stored)
+            if (_libraryManager.GetItemById(item.Id) is { } stored && JellyfinLibraryView.IsAttached(stored))
             {
                 existing.TryAdd(stored.Id, stored);
             }
@@ -439,8 +479,7 @@ public sealed class TargetedUpdater : IDisposable
                     await CarryAsync(item, pair.New, pair.SharesKey, cancellationToken).ConfigureAwait(false);
                 }
 
-                item.SetParent(null);
-                _libraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation = false }, d.Parent, false);
+                Remove(item, d.Parent);
                 actuallyRemoved.Add(item);
             }
         }
@@ -584,5 +623,155 @@ public sealed class TargetedUpdater : IDisposable
                 new[] { Deferred, LeftAlone.Count == 0 ? null : "left for the scheduled scan (file still exists): " + string.Join("; ", LeftAlone.Select(Describe)) }
                     .OfType<string>())
                 is { Length: > 0 } detail ? detail : null);
+    }
+
+    /// <summary>
+    /// Removes an item and its descendants from the library (never its files), and watches their ids
+    /// for a refresh that writes them back.
+    /// </summary>
+    /// <param name="item">The item.</param>
+    /// <param name="parent">Its parent; null for an item written back without one, whose owner (if any) Jellyfin finds itself.</param>
+    private void Remove(BaseItem item, BaseItem? parent)
+    {
+        var ids = (item is Folder
+                ? _libraryManager.GetItemIds(new InternalItemsQuery { AncestorIds = [item.Id], IncludeOwnedItems = true, IncludeAlternateVersions = true })
+                : [])
+            .Append(item.Id);
+
+        // Watched before the delete, so a save landing between the delete and this line is not missed.
+        _removed.Removed(ids, DateTime.UtcNow);
+        Wake();
+
+        var options = new DeleteOptions { DeleteFileLocation = false };
+        item.SetParent(null);
+        if (parent is null)
+        {
+            _libraryManager.DeleteItem(item, options, false);
+        }
+        else
+        {
+            _libraryManager.DeleteItem(item, options, parent, false);
+        }
+    }
+
+    // Runs on whichever thread saved the item, inside Jellyfin's save: lookups, nothing else.
+    private void OnItemSaved(object? sender, ItemChangeEventArgs e)
+    {
+        if (_removed.Saved(e.Item.Id, e.Item.ParentId, e.Item.OwnerId, DateTime.UtcNow))
+        {
+            Wake();
+        }
+    }
+
+    private void Wake()
+    {
+        if (_wake.CurrentCount == 0)
+        {
+            try
+            {
+                _wake.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+                // already awake
+            }
+        }
+    }
+
+    /// <summary>
+    /// The one worker that looks again at removed items: sleeps until something is due (or a removal or
+    /// save wakes it), then judges everything due in one pass under the webhook gate.
+    /// </summary>
+    private async Task WatchRemovedAsync()
+    {
+        IReadOnlyList<Guid> due = [];
+        while (!_stopping.IsCancellationRequested)
+        {
+            try
+            {
+                // Capped, so a clock that jumps cannot ask for a wait WaitAsync refuses.
+                var next = _removed.NextDue();
+                var wait = next is null ? MaxIdle : next.Value - DateTime.UtcNow;
+                if (wait > TimeSpan.Zero)
+                {
+                    await _wake.WaitAsync(wait < MaxIdle ? wait : MaxIdle, _stopping.Token).ConfigureAwait(false);
+                    continue; // woken or due: work out what is due afresh
+                }
+
+                due = _removed.TakeDue(DateTime.UtcNow);
+                if (due.Count == 0)
+                {
+                    continue;
+                }
+
+                await _gate.WaitAsync(_stopping.Token).ConfigureAwait(false);
+                try
+                {
+                    await JudgeRemovedAsync(due).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _gate.Release();
+                }
+
+                due = [];
+            }
+            catch (OperationCanceledException)
+            {
+                return; // shutting down
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "ArrRefresh: checking removed items again failed; trying again in 30 s");
+                _removed.DueAgain(due, DateTime.UtcNow + RetryAfter); // taken off the schedule, not judged
+                due = [];
+                try
+                {
+                    await Task.Delay(RetryAfter, _stopping.Token).ConfigureAwait(false); // never spin on a persistent fault
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    private async Task JudgeRemovedAsync(IReadOnlyList<Guid> ids)
+    {
+        var view = new JellyfinLibraryView(_libraryManager);
+        var recreate = new List<string>();
+        foreach (var id in ids)
+        {
+            var item = _libraryManager.GetItemById(id);
+            if (item is null)
+            {
+                continue;
+            }
+
+            var path = PathUtil.Normalize(item.Path);
+            var location = path is null ? null : PathUtil.LocationOf(path, view.LibraryLocations);
+            switch (RemovedItemRule.Judge(JellyfinLibraryView.IsAttached(item), path is not null && OnDisk(path), location is not null && Directory.Exists(location)))
+            {
+                case RemovedItemVerdict.Keep:
+                    // Still watched: a stale save of the copy that was removed can land after the re-import.
+                    break;
+                case RemovedItemVerdict.Remove:
+                    Remove(item, item.GetParent());
+                    _logger.LogInformation("ArrRefresh: {Item} was saved back by a metadata refresh that was still running when it was removed; removed it again", Describe(item));
+                    break;
+                case RemovedItemVerdict.Recreate:
+                    recreate.Add(path!);
+                    _logger.LogInformation("ArrRefresh: {Item} was saved back with no parent over a file that exists; reconciling its path", Describe(item));
+                    break;
+                case RemovedItemVerdict.Wait:
+                    break;
+            }
+        }
+
+        if (recreate.Count > 0)
+        {
+            await ApplyLockedAsync(recreate, [], "saved back").ConfigureAwait(false);
+        }
     }
 }

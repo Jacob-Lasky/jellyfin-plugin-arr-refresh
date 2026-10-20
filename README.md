@@ -74,6 +74,11 @@ Rules it keeps:
   even if the arr hangs up: new items are created, replacements inherit what the old items had, and
   only then are old items removed.
 - **One event at a time**, so an import and the rename that follows it cannot interleave.
+- **A removed item stays removed.** Jellyfin writes an item back, with no parent, when a metadata
+  refresh of it was still running as it was removed (an import followed seconds later by an upgrade
+  does this). Such a row is invisible in the library but found by search. For 30 minutes after a
+  removal the plugin watches for that and removes the item again, or, when a file exists at its path
+  again, reconciles the path so the item gets its parent back.
 
 ## Install
 
