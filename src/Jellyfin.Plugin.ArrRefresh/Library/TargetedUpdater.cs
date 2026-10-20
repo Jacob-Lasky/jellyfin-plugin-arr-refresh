@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.ArrRefresh.Planning;
+using Jellyfin.Plugin.ArrRefresh.Search;
 using Jellyfin.Plugin.ArrRefresh.Webhooks;
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
@@ -36,6 +37,7 @@ public sealed class TargetedUpdater : IDisposable
     private readonly IFileSystem _fileSystem;
     private readonly IUserManager _userManager;
     private readonly IUserDataManager _userDataManager;
+    private readonly SearchIndexSync _search;
     private readonly ILogger<TargetedUpdater> _logger;
 
     // One webhook at a time: a Download followed by a Rename of the same movie must not interleave.
@@ -49,6 +51,7 @@ public sealed class TargetedUpdater : IDisposable
     /// <param name="fileSystem">The file system.</param>
     /// <param name="userManager">The user manager.</param>
     /// <param name="userDataManager">The user data manager.</param>
+    /// <param name="search">Keeps the search index current for the items this touches.</param>
     /// <param name="logger">The logger.</param>
     public TargetedUpdater(
         ILibraryManager libraryManager,
@@ -56,6 +59,7 @@ public sealed class TargetedUpdater : IDisposable
         IFileSystem fileSystem,
         IUserManager userManager,
         IUserDataManager userDataManager,
+        SearchIndexSync search,
         ILogger<TargetedUpdater> logger)
     {
         _libraryManager = libraryManager;
@@ -63,6 +67,7 @@ public sealed class TargetedUpdater : IDisposable
         _fileSystem = fileSystem;
         _userManager = userManager;
         _userDataManager = userDataManager;
+        _search = search;
         _logger = logger;
         if (UpdateFromResolvedItem is null)
         {
@@ -119,6 +124,7 @@ public sealed class TargetedUpdater : IDisposable
 
             // Exactly what BaseItem.ChangedExternally() queues: RefreshMetadata, then ValidateChildren
             // of this folder only.
+            _search.Track(folderRefreshes);
             foreach (var id in folderRefreshes)
             {
                 QueueRefresh(id);
@@ -355,6 +361,10 @@ public sealed class TargetedUpdater : IDisposable
 
     private async Task CommitAsync(List<Diff> diffs, IReadOnlyList<PathReplacement> replacements, CancellationToken cancellationToken)
     {
+        // Before creating anything, so the ItemAdded of each new item (and later of its new children,
+        // and the ItemUpdated of its metadata refresh) reaches the search index.
+        _search.Track(diffs.SelectMany(d => d.Created.Select(i => i.Id).Concat(d.Kept.Select(k => k.Stored.Id))));
+
         foreach (var d in diffs.Where(d => d.Created.Count > 0))
         {
             foreach (var item in d.Created)

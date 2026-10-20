@@ -25,6 +25,13 @@
                         <textarea is="emby-textarea" id="PathMappings" name="PathMappings" rows="4" class="emby-textarea" placeholder="/data/media => /media"></textarea>
                         <div class="fieldDescription">One per line: the path as Sonarr/Radarr see it, <code>=&gt;</code>, the path as Jellyfin sees it. Leave empty when both mount the media at the same path.</div>
                     </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label class="emby-checkbox-label">
+                            <input id="UpdateSearchIndex" name="UpdateSearchIndex" type="checkbox" is="emby-checkbox" />
+                            <span>Update the Meilisearch search index</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">When the Meilisearch plugin is installed, items this plugin adds or changes become searchable within seconds instead of at that plugin's next full reindex. Uses that plugin's own connection settings.</div>
+                    </div>
                     <div>
                         <button is="emby-button" type="submit" class="raised button-submit block emby-button">
                             <span>Save</span>
@@ -46,6 +53,7 @@
                     Dashboard.showLoadingMsg();
                     ApiClient.getPluginConfiguration(ArrRefreshConfig.pluginUniqueId).then(function (config) {
                         document.querySelector('#PathMappings').value = config.PathMappings || '';
+                        document.querySelector('#UpdateSearchIndex').checked = config.UpdateSearchIndex !== false;
                         Dashboard.hideLoadingMsg();
                     });
                 });
@@ -55,6 +63,7 @@
                     Dashboard.showLoadingMsg();
                     ApiClient.getPluginConfiguration(ArrRefreshConfig.pluginUniqueId).then(function (config) {
                         config.PathMappings = document.querySelector('#PathMappings').value;
+                        config.UpdateSearchIndex = document.querySelector('#UpdateSearchIndex').checked;
                         ApiClient.updatePluginConfiguration(ArrRefreshConfig.pluginUniqueId, config).then(function (result) {
                             Dashboard.processPluginConfigurationUpdateResult(result);
                         });

@@ -12,16 +12,29 @@ each one. The container is removed at the end, pass or fail.
 Assertions are on item types, paths, watch state and collection membership, never on names,
 because names come from TMDb/TVDb and the sandbox may or may not have network access.
 """
+import hashlib
+import io
 import json
 import os
+import tempfile
+import zipfile
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
 IMAGE = "jellyfin/jellyfin:12.2.20261005-225228"  # the 12.2.0 release build; matches targetAbi
+# The search backend Tower runs: Meilisearch 1.12.8 and arnesacnussem's Meilisearch plugin 1.12.1.5,
+# fetched from its own release and checked against the MD5 its manifest publishes.
+MEILI_IMAGE = "getmeili/meilisearch:v1.12.8"
+MEILI_KEY = "it-only-master-key-0123456789"
+MEILI_INDEX = "it"
+MEILI_PLUGIN_ID = "974395db-b31d-46a2-bc86-ef9aa5ac04dd"
+MEILI_PLUGIN_ZIP = ("https://github.com/arnesacnussem/jellyfin-plugin-meilisearch/releases/download/1.12.1.5/meilisearch_1.12.1.5.zip",
+                    "4efd0b1c543da292a9f7c46f720cb98a")
 NAME = "arr-refresh-it-%d-%s" % (os.getpid(), uuid.uuid4().hex[:8])  # unique even for runs started in the same second
 MOVIES, TV = "/data/media/movies", "/data/media/tv"
 HEAT = MOVIES + "/Heat (1995) {tmdb-949}"
@@ -36,7 +49,7 @@ BRAZIL = MOVIES + "/Brazil (1985)"  # no id anywhere in its path, so no shared u
 CLUE = MOVIES + "/Clue (1985)"  # deleted while an unrelated movie is added, in one request
 ANDOR = TV + "/Andor (2022) {tvdb-393189}"
 
-base = token = user_id = None
+base = token = user_id = meili = None
 failures = []
 
 
@@ -99,6 +112,7 @@ def check(description, condition):
     print("ok  " if condition else "FAIL", description)
     if not condition:
         failures.append(description)
+    return condition
 
 
 def paths_of(types):
@@ -112,12 +126,55 @@ def root_validations():
     return [line for line in log.splitlines() if "will be refreshed" in line or "Validating media library" in line]
 
 
+def meili_api(method, path, body=None):
+    req = urllib.request.Request(meili + path, method=method, headers={"Authorization": "Bearer " + MEILI_KEY, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, json.dumps(body).encode() if body is not None else None, timeout=30) as r:
+            return r.status, json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except OSError:
+        return 0, None
+
+
+def meili_doc(item_id):
+    """The search document for a Jellyfin item id, or None."""
+    guid = "%s-%s-%s-%s-%s" % (item_id[:8], item_id[8:12], item_id[12:16], item_id[16:20], item_id[20:])
+    status, doc = meili_api("GET", "/indexes/%s/documents/%s" % (MEILI_INDEX, guid))
+    return doc if status == 200 else None
+
+
+def search(term):
+    """Paths Jellyfin's search (through the Meilisearch plugin) returns for a term."""
+    q = "/Items?Recursive=true&searchTerm=%s&IncludeItemTypes=Movie,Episode,Series&Fields=Path&userId=%s" % (urllib.parse.quote(term), user_id)
+    return {i.get("Path") for i in api("GET", q, expect=200)[1]["Items"]}
+
+
+def install_meilisearch_plugin():
+    with urllib.request.urlopen(MEILI_PLUGIN_ZIP[0], timeout=120) as r:
+        data = r.read()
+    if hashlib.md5(data).hexdigest() != MEILI_PLUGIN_ZIP[1]:
+        raise AssertionError("Meilisearch plugin download does not match its manifest checksum")
+    with tempfile.TemporaryDirectory() as d:
+        zipfile.ZipFile(io.BytesIO(data)).extractall(os.path.join(d, "Meilisearch_1.12.1.5"))
+        sh("docker", "cp", os.path.join(d, "Meilisearch_1.12.1.5"), NAME + ":/tmp/")
+    ex("cp -r /tmp/Meilisearch_1.12.1.5 /config/plugins/")
+
+
 def setup(dll):
-    global base, token, user_id
+    global base, token, user_id, meili
+    # Meilisearch sizes its indexing memory from the host's RAM, not the container limit, and is OOM-killed
+    # under a cap unless told otherwise (Tower sets MEILI_MAX_INDEXING_MEMORY for the same reason).
+    sh("docker", "run", "-d", "--name", NAME + "-meili", "--memory=2g", "--memory-swap=2g", "-e", "MEILI_MASTER_KEY=" + MEILI_KEY,
+       "-e", "MEILI_MAX_INDEXING_MEMORY=512MiB",
+       "-e", "MEILI_NO_ANALYTICS=true", "-e", "MEILI_HTTP_ADDR=0.0.0.0:7700", MEILI_IMAGE)
+    meili = "http://%s:7700" % sh("docker", "inspect", NAME + "-meili", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}")
+    wait_for("Meilisearch answers", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
     sh("docker", "create", "--name", NAME, "--user", "99:100", "--memory=2g", "--memory-swap=2g", IMAGE)
     sh("docker", "cp", dll, NAME + ":/tmp/plugin.dll")
     sh("docker", "start", NAME)
     ex("mkdir -p /config/plugins/ArrRefresh_it && cp /tmp/plugin.dll /config/plugins/ArrRefresh_it/")
+    install_meilisearch_plugin()
     sh("docker", "exec", "-u", "0", NAME, "sh", "-c", "mkdir -p %s %s %s && chown -R 99:100 /data" % (MOVIES, TV, SHARE))
     for p in [HEAT + "/Heat (1995) {tmdb-949} [Bluray-1080p].mkv",
               ALIEN + "/Alien (1979) {tmdb-348} [Bluray-1080p].mkv",
@@ -140,12 +197,19 @@ def setup(dll):
     user_id = api("GET", "/Users", expect=200)[1][0]["Id"]
     plugins = {p["Name"]: p["Status"] for p in api("GET", "/Plugins", expect=200)[1]}
     check("plugin loaded and active", plugins.get("Arr Refresh") == "Active")
+    check("Meilisearch plugin loaded and active", plugins.get("Meilisearch") == "Active")
+    api("POST", "/Plugins/%s/Configuration" % MEILI_PLUGIN_ID,
+        {"ApiKey": MEILI_KEY, "Url": meili, "Debug": False, "IndexName": MEILI_INDEX, "MatchingStrategy": "last"}, expect=204)
+    wait_for("Meilisearch plugin connected", lambda: api("GET", "/meilisearch/reconnect", expect=200)[1]["meilisearchOk"], timeout=60)
     for name, ctype, path in [("Movies", "movies", MOVIES), ("TV", "tvshows", TV), ("Share", "movies", SHARE)]:
         api("POST", "/Library/VirtualFolders?name=%s&collectionType=%s&paths=%s&refreshLibrary=false" % (name, ctype, path),
             {"LibraryOptions": {"EnableRealtimeMonitor": False, "PathInfos": [{"Path": path}]}}, expect=204)
     api("POST", "/Library/Refresh", expect=204)
     wait_for("initial scan finds 6 movies and 2 episodes",
              lambda: len(items("Movie")) == 6 and len(items("Episode")) == 2, timeout=180)
+    # Their full reindex once, as Tower's runs nightly, so the index exists with documents in their shape.
+    api("GET", "/meilisearch/reindex", expect=200)
+    wait_for("Meilisearch index built", lambda: (meili_api("GET", "/indexes/%s/stats" % MEILI_INDEX)[1] or {}).get("numberOfDocuments", 0) > 0, timeout=60)
 
 
 def _public_ok():
@@ -184,6 +248,9 @@ def run():
     check("rename: library has the new path and not the old", wait_for("rename visible", lambda: new in paths_of("Movie") and old not in paths_of("Movie")))
     renamed = next(i for i in items("Movie") if i["Path"] == new)
     check("rename: watch state carried over", renamed["UserData"]["Played"])
+    check("rename: the new item is in the search index", wait_for("renamed document", lambda: meili_doc(renamed["Id"]), timeout=60) is not None)
+    check("rename: search finds the new path", wait_for("renamed searchable", lambda: new in search("Heat"), timeout=60))
+    check("rename: the old item's document was removed", wait_for("old document gone", lambda: meili_doc(heat_id) is None, timeout=60))
     check("rename: collection membership carried over",
           [i["Path"] for i in api("GET", "/Items?ParentId=%s&Fields=Path" % coll, expect=200)[1]["Items"]] == [new])
 
@@ -192,6 +259,9 @@ def run():
     make_video(dune)
     webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": DUNE}, "movieFile": {"path": dune}})
     check("import: new movie appears", wait_for("import visible", lambda: dune in paths_of("Movie")))
+    dune_id = next(i["Id"] for i in items("Movie") if i["Path"] == dune)
+    check("import: its search document is written", wait_for("dune document", lambda: meili_doc(dune_id), timeout=60) is not None)
+    check("import: Jellyfin search finds it by title", wait_for("dune searchable", lambda: dune in search("Dune"), timeout=60))
 
     # Radarr upgrade: old file deleted, new file imported, in one event.
     a_old, a_new = ALIEN + "/Alien (1979) {tmdb-348} [Bluray-1080p].mkv", ALIEN + "/Alien (1979) {tmdb-348} [Remux-2160p].mkv"
@@ -265,6 +335,8 @@ def run():
     make_video(k1)
     webhook({"eventType": "Download", "instanceName": "Sonarr", "series": {"path": ANDOR}, "episodeFile": {"path": k1}})
     check("new series: series and episode appear", wait_for("series visible", lambda: ANDOR in paths_of("Series") and k1 in paths_of("Episode")))
+    k1_id = next(i["Id"] for i in items("Episode") if i["Path"] == k1)
+    check("new series: its episode, created by the series refresh, is in the search index", wait_for("episode document", lambda: meili_doc(k1_id), timeout=60) is not None)
 
     # A multi-episode file replaces E01 (unwatched) and E02 (watched): the one new item has two
     # predecessors, so it inherits neither one's history through the plugin.
@@ -372,6 +444,28 @@ def run():
     check("folder move: new path only", wait_for("move visible", lambda: moved_file in paths_of("Movie") and new not in paths_of("Movie")))
     check("folder move: watch state carried over", next(i for i in items("Movie") if i["Path"] == moved_file)["UserData"]["Played"])
 
+    # Witness. Jellyfin uses Meilisearch's hits whenever it has any and falls back to its database only
+    # when it has none, so a unique title is found either way. "Heat Wave" also matches the indexed Heat
+    # documents, so it is found only once its own document is in the index, which is what Tower users see.
+    # Precondition, or the witness proves nothing: Meilisearch must already have a hit for "Heat Wave"
+    # (the moved Heat), so the database fallback stays out of it.
+    check("witness precondition: Meilisearch has a hit for the control title",
+          wait_for("heat hit", lambda: (meili_api("POST", "/indexes/%s/search" % MEILI_INDEX, {"q": "Heat Wave"})[1] or {}).get("hits"), timeout=60))
+    api("POST", "/Plugins/%s/Configuration" % PLUGIN_ID, {"PathMappings": "", "UpdateSearchIndex": False}, expect=204)
+    wave = MOVIES + "/Heat Wave (2007)/Heat Wave (2007).mkv"
+    make_video(wave)
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": wave.rsplit("/", 1)[0]}, "movieFile": {"path": wave}})
+    wait_for("heat wave visible", lambda: wave in paths_of("Movie"))
+    time.sleep(15)
+    check("search update off: the new movie is not written to the index", meili_doc(next(i["Id"] for i in items("Movie") if i["Path"] == wave)) is None)
+    found = search("Heat Wave")
+    if not check("search update off: search for its title does not find it", wave not in found):
+        print("    meili hits:", [(h.get("name"), h.get("path")) for h in (meili_api("POST", "/indexes/%s/search" % MEILI_INDEX, {"q": "Heat Wave", "limit": 10})[1] or {}).get("hits", [])])
+        print("    jellyfin search:", found)
+    api("POST", "/Plugins/%s/Configuration" % PLUGIN_ID, {"PathMappings": "", "UpdateSearchIndex": True}, expect=204)
+    api("POST", "/ArrRefresh/Paths", {"Paths": [wave]}, expect=200)
+    check("search update on: the same title is now found", wait_for("heat wave searchable", lambda: wave in search("Heat Wave"), timeout=60))
+
     # Path mapping: the arr sees /arr/media, Jellyfin sees /data/media.
     api("POST", "/Plugins/%s/Configuration" % PLUGIN_ID, {"PathMappings": "/arr/media => /data/media"}, expect=204)
     mapped = DUNE + "/Dune (2021) {tmdb-438631} [WEBDL-1080p].mkv"
@@ -403,6 +497,9 @@ def main():
     try:
         setup(dll)
         run()
+    except Exception as e:
+        failures.append("exception: %r" % e)
+        raise
     finally:
         if failures:
             out = subprocess.run(["docker", "logs", NAME], capture_output=True, text=True)
@@ -412,6 +509,7 @@ def main():
             print("full server log:", log_path)
             print("\n".join((out.stdout + out.stderr).splitlines()[-60:]))
         subprocess.run(["docker", "rm", "-fv", NAME], capture_output=True)  # -v: the image's anonymous /config and /cache volumes
+        subprocess.run(["docker", "rm", "-fv", NAME + "-meili"], capture_output=True)
     print("\n%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
 
