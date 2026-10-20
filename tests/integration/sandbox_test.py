@@ -32,6 +32,10 @@ IMAGE = "jellyfin/jellyfin:12.2.20261005-225228"  # the 12.2.0 release build; ma
 MEILI_IMAGE = "getmeili/meilisearch:v1.12.8"
 MEILI_KEY = "it-only-master-key-0123456789"
 MEILI_INDEX = "it"
+# Jellyfin reaches Meilisearch by name on a network of its own, so a restart cannot move it to another
+# address and a stopped server fails requests at once (nothing is left in a socket buffer to be executed
+# later). The test itself reaches it on the default bridge.
+MEILI_URL_FOR_JELLYFIN = "http://meili:7700"
 MEILI_PLUGIN_ID = "974395db-b31d-46a2-bc86-ef9aa5ac04dd"
 MEILI_PLUGIN_ZIP = ("https://github.com/arnesacnussem/jellyfin-plugin-meilisearch/releases/download/1.12.1.5/meilisearch_1.12.1.5.zip",
                     "4efd0b1c543da292a9f7c46f720cb98a")
@@ -154,6 +158,11 @@ def search(term):
     return {i.get("Path") for i in api("GET", q, expect=200)[1]["Items"]}
 
 
+def meili_bridge_url():
+    ip = sh("docker", "inspect", NAME + "-meili", "--format", '{{(index .NetworkSettings.Networks "bridge").IPAddress}}')
+    return "http://%s:7700" % ip
+
+
 def install_meilisearch_plugin():
     with urllib.request.urlopen(MEILI_PLUGIN_ZIP[0], timeout=120) as r:
         data = r.read()
@@ -169,12 +178,16 @@ def setup(dll):
     global base, token, user_id, meili
     # Meilisearch sizes its indexing memory from the host's RAM, not the container limit, and is OOM-killed
     # under a cap unless told otherwise (Tower sets MEILI_MAX_INDEXING_MEMORY for the same reason).
-    sh("docker", "run", "-d", "--name", NAME + "-meili", "--memory=2g", "--memory-swap=2g", "-e", "MEILI_MASTER_KEY=" + MEILI_KEY,
+    sh("docker", "network", "create", NAME + "-net")
+    sh("docker", "run", "-d", "--name", NAME + "-meili", "--network", NAME + "-net", "--network-alias", "meili",
+       "--memory=2g", "--memory-swap=2g", "-e", "MEILI_MASTER_KEY=" + MEILI_KEY,
        "-e", "MEILI_MAX_INDEXING_MEMORY=512MiB",
        "-e", "MEILI_NO_ANALYTICS=true", "-e", "MEILI_HTTP_ADDR=0.0.0.0:7700", MEILI_IMAGE)
-    meili = "http://%s:7700" % sh("docker", "inspect", NAME + "-meili", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}")
+    sh("docker", "network", "connect", "bridge", NAME + "-meili")
+    meili = meili_bridge_url()
     wait_for("Meilisearch answers", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
     sh("docker", "create", "--name", NAME, "--user", "99:100", "--memory=2g", "--memory-swap=2g", IMAGE)
+    sh("docker", "network", "connect", NAME + "-net", NAME)
     sh("docker", "cp", dll, NAME + ":/tmp/plugin.dll")
     sh("docker", "start", NAME)
     ex("mkdir -p /config/plugins/ArrRefresh_it && cp /tmp/plugin.dll /config/plugins/ArrRefresh_it/")
@@ -206,7 +219,7 @@ def setup(dll):
     check("plugin loaded and active", plugins.get("Arr Refresh") == "Active")
     check("Meilisearch plugin loaded and active", plugins.get("Meilisearch") == "Active")
     api("POST", "/Plugins/%s/Configuration" % MEILI_PLUGIN_ID,
-        {"ApiKey": MEILI_KEY, "Url": meili, "Debug": False, "IndexName": MEILI_INDEX, "MatchingStrategy": "last"}, expect=204)
+        {"ApiKey": MEILI_KEY, "Url": MEILI_URL_FOR_JELLYFIN, "Debug": False, "IndexName": MEILI_INDEX, "MatchingStrategy": "last"}, expect=204)
     wait_for("Meilisearch plugin connected", lambda: api("GET", "/meilisearch/reconnect", expect=200)[1]["meilisearchOk"], timeout=60)
     for name, ctype, path in [("Movies", "movies", MOVIES), ("TV", "tvshows", TV), ("Share", "movies", SHARE)]:
         api("POST", "/Library/VirtualFolders?name=%s&collectionType=%s&paths=%s&refreshLibrary=false" % (name, ctype, path),
@@ -238,7 +251,7 @@ def _public_ok():
 
 
 def run():
-    global MEILI_INDEX
+    global MEILI_INDEX, meili
     status, _ = api("POST", "/ArrRefresh/Webhook", {"eventType": "Test", "movie": {}}, auth=False)
     check("webhook without credentials is refused (401)", status == 401)
     check("Test event answers test-ok", webhook({"eventType": "Test", "movie": {"folderPath": "C:\\testpath"}})["Status"] == "test-ok")
@@ -565,14 +578,11 @@ def run():
     wait_for("document deleted", lambda: meili_doc(wave_id) is None, timeout=30)
     check("document lost to a rebuild is written again by the verification pass", wait_for("document restored", lambda: meili_doc(wave_id), timeout=240) is not None)
 
-    # Meilisearch refusing writes: they must be retried until it accepts them. Refusal (a wrong key in
-    # the Meilisearch plugin's settings, which this plugin uses) rather than an outage: requests to a
-    # stopped or paused server can sit in a socket buffer and be executed when it returns, so an outage
-    # cannot tell a retry from a late delivery. A refused write is simply gone.
-    def meili_config(key):
-        api("POST", "/Plugins/%s/Configuration" % MEILI_PLUGIN_ID,
-            {"ApiKey": key, "Url": meili, "Debug": False, "IndexName": MEILI_INDEX, "MatchingStrategy": "last"}, expect=204)
-    meili_config("wrong-key-for-the-retry-check")
+    # Meilisearch down (game mode stops it): writes fail and must be retried until it is back. Jellyfin
+    # reaches it by name, so while it is stopped every request fails at once and none can be delivered
+    # late. (A config change cannot be used to make it refuse: the Meilisearch plugin rebuilds its whole
+    # index on every config change, which would deliver the document itself.)
+    sh("docker", "stop", "-t", "10", NAME + "-meili")
     seven = LOCAL + "/Se7en (1995)/Se7en (1995).mkv"
     make_video(seven)
     webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": seven.rsplit("/", 1)[0]}, "movieFile": {"path": seven}})
@@ -582,12 +592,13 @@ def run():
     def refreshed():
         q = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path"
         return any(i["Path"] == seven and i.get("RunTimeTicks") for i in api("GET", q, expect=200)[1]["Items"])
-    wait_for("se7en refreshed while refused", refreshed, timeout=120)
+    wait_for("se7en refreshed during the outage", refreshed, timeout=120)
     time.sleep(15)
-    check("refused write: nothing reached the index yet", meili_doc(next(i["Id"] for i in items("Movie") if i["Path"] == seven)) is None)
-    meili_config(MEILI_KEY)
+    sh("docker", "start", NAME + "-meili")
+    meili = meili_bridge_url()
+    wait_for("Meilisearch back", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
     seven_id = next(i["Id"] for i in items("Movie") if i["Path"] == seven)
-    check("refused write: it is retried and lands once Meilisearch accepts it", wait_for("se7en document", lambda: meili_doc(seven_id), timeout=180) is not None)
+    check("Meilisearch outage: the write is retried and lands once it is back", wait_for("se7en document", lambda: meili_doc(seven_id), timeout=180) is not None)
 
     steps = api("POST", "/ArrRefresh/Paths", {"Paths": [MOVIES, TV + "/", "/etc/passwd"]}, expect=200)[1]["Steps"]
     check("library roots and outside paths are skipped", [s["Action"] for s in steps] == ["Skip", "Skip", "Skip"])
@@ -597,7 +608,7 @@ def run():
     # With no index name set, the Meilisearch plugin names its index after the server (spaces to dashes);
     # the writes must follow it there. Last, because it switches the index everything above used.
     server = api("GET", "/System/Info/Public", auth=False, expect=200)[1]["ServerName"].replace(" ", "-")
-    api("POST", "/Plugins/%s/Configuration" % MEILI_PLUGIN_ID, {"ApiKey": MEILI_KEY, "Url": meili, "Debug": False, "IndexName": "", "MatchingStrategy": "last"}, expect=204)
+    api("POST", "/Plugins/%s/Configuration" % MEILI_PLUGIN_ID, {"ApiKey": MEILI_KEY, "Url": MEILI_URL_FOR_JELLYFIN, "Debug": False, "IndexName": "", "MatchingStrategy": "last"}, expect=204)
     wait_for("reconnected", lambda: api("GET", "/meilisearch/reconnect", expect=200)[1]["meilisearchOk"], timeout=60)
     api("GET", "/meilisearch/reindex", expect=200)
     MEILI_INDEX = server
@@ -627,6 +638,7 @@ def main():
             print("\n".join((out.stdout + out.stderr).splitlines()[-60:]))
         subprocess.run(["docker", "rm", "-fv", NAME], capture_output=True)  # -v: the image's anonymous /config and /cache volumes
         subprocess.run(["docker", "rm", "-fv", NAME + "-meili"], capture_output=True)
+        subprocess.run(["docker", "network", "rm", NAME + "-net"], capture_output=True)
     print("\n%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
 
