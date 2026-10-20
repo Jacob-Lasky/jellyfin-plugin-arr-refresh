@@ -468,20 +468,25 @@ def run():
     def twin_sources():
         q = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources"
         return sorted(m["Path"] for i in api("GET", q, expect=200)[1]["Items"] if i["Path"].startswith(MOVIES + "/Twin (2010)") for m in i.get("MediaSources", []))
-    merge(vA, vB)
-    # 1. Renamed inside a folder that still exists: only a by-path lookup that includes versions finds
-    #    the old item (the folder resolves, so the children listing is not consulted).
-    vB2 = vB.replace(".mkv", " [Bluray-1080p].mkv")
-    ex('mv "%s" "%s"' % (vB, vB2))
-    webhook({"eventType": "Rename", "instanceName": "Radarr", "movie": {"folderPath": vB.rsplit("/", 1)[0]},
-             "renamedMovieFiles": [{"path": vB2, "previousPath": vB}]})
-    check("merged version renamed: the old item is gone", wait_for("merged rename", lambda: vB not in twin_sources() and vB2 in twin_sources(), timeout=60))
-    # 2. Deleted with its folder, the payload naming only the folder: only a children listing that
-    #    includes versions finds it.
-    merge(vA, vB2)
-    ex('rm -r "%s"' % vB.rsplit("/", 1)[0])
-    webhook({"eventType": "MovieDelete", "instanceName": "Radarr", "movie": {"folderPath": vB.rsplit("/", 1)[0]}, "deletedFiles": True})
-    check("merged version deleted with its folder: only the surviving copy is left", wait_for("merged version gone", lambda: twin_sources() == [vA], timeout=60))
+    def merged_alternate(a, b):
+        """Merge two copies; return (primary, alternate). Only the alternate is hidden from item lists."""
+        merge(a, b)
+        listed = wait_for("one copy hidden", lambda: (lambda p: p if len(p & {a, b}) == 1 else None)(paths_of("Movie")), timeout=30)
+        return (a, b) if a in listed else (b, a)
+    # 1. The hidden copy renamed inside a folder that still exists: only a by-path lookup that includes
+    #    versions finds the old item (the folder resolves, so the children listing is not consulted).
+    primary, alt = merged_alternate(vA, vB)
+    alt2 = alt.replace(".mkv", " [Bluray-1080p].mkv")
+    ex('mv "%s" "%s"' % (alt, alt2))
+    webhook({"eventType": "Rename", "instanceName": "Radarr", "movie": {"folderPath": alt.rsplit("/", 1)[0]},
+             "renamedMovieFiles": [{"path": alt2, "previousPath": alt}]})
+    check("merged version renamed: the old item is gone", wait_for("merged rename", lambda: alt not in twin_sources() and alt2 in twin_sources(), timeout=60))
+    # 2. The hidden copy deleted with its folder, the payload naming only the folder: only a children
+    #    listing that includes versions finds it.
+    primary, alt = merged_alternate(primary, alt2)
+    ex('rm -r "%s"' % alt.rsplit("/", 1)[0])
+    webhook({"eventType": "MovieDelete", "instanceName": "Radarr", "movie": {"folderPath": alt.rsplit("/", 1)[0]}, "deletedFiles": True})
+    check("merged version deleted with its folder: only the surviving copy is left", wait_for("merged version gone", lambda: twin_sources() == [primary], timeout=60))
 
     # A stray copy imported from inside the library (manual import with Move): the arr names the old
     # file as the import's sourcePath, and the imported item inherits its watch state.
