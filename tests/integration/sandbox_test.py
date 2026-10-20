@@ -565,8 +565,11 @@ def run():
     wait_for("document deleted", lambda: meili_doc(wave_id) is None, timeout=30)
     check("document lost to a rebuild is written again by the verification pass", wait_for("document restored", lambda: meili_doc(wave_id), timeout=240) is not None)
 
-    # Meilisearch down (game mode stops it): the write waits and goes through once it is back.
-    sh("docker", "stop", "-t", "10", NAME + "-meili")
+    # Meilisearch unreachable (game mode stops it): the write waits and goes through once it is back.
+    # Paused rather than stopped: a stopped container can come back on another address when several
+    # sandboxes run at once, which would test the network instead of the retry. A paused one never
+    # answers, so requests time out, which is the failure a retry has to handle.
+    sh("docker", "pause", NAME + "-meili")
     seven = LOCAL + "/Se7en (1995)/Se7en (1995).mkv"
     make_video(seven)
     webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": seven.rsplit("/", 1)[0]}, "movieFile": {"path": seven}})
@@ -579,11 +582,10 @@ def run():
         q = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path"
         return any(i["Path"] == seven and i.get("RunTimeTicks") for i in api("GET", q, expect=200)[1]["Items"])
     wait_for("se7en refreshed during the outage", refreshed, timeout=120)
-    # Longer than the plugin's 30 s request timeout: a stopped container's address sends no reset, so a
-    # write in flight keeps retransmitting and would simply succeed when Meilisearch returns. Only once it
-    # has timed out does delivery depend on the retry.
+    # Longer than the plugin's 30 s request timeout: a write in flight would otherwise simply complete
+    # when Meilisearch resumes. Only once it has timed out does delivery depend on the retry.
     time.sleep(45)
-    sh("docker", "start", NAME + "-meili")
+    sh("docker", "unpause", NAME + "-meili")
     wait_for("Meilisearch back", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
     seven_id = next(i["Id"] for i in items("Movie") if i["Path"] == seven)
     check("Meilisearch outage: the write is retried and lands once it is back", wait_for("se7en document", lambda: meili_doc(seven_id), timeout=180) is not None)
