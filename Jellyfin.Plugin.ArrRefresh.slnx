@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Jellyfin.Plugin.ArrRefresh/Jellyfin.Plugin.ArrRefresh.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Jellyfin.Plugin.ArrRefresh.Tests/Jellyfin.Plugin.ArrRefresh.Tests.csproj" />
+  </Folder>
+</Solution>

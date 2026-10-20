@@ -1,0 +1,18 @@
+# Plugin metadata for the repository manifest. The version comes from Directory.Build.props.
+name: "Arr Refresh"
+guid: "89c19d1d-6a41-4cc3-aad3-d72b1d32039f"
+# The Jellyfin server version the plugin is compiled and tested against (Jellyfin.Controller in the csproj).
+targetAbi: "12.2.0.0"
+framework: "net10.0"
+owner: "Jacob-Lasky"
+category: "General"
+overview: "Sonarr/Radarr webhooks update only the movie or episode that changed, never the whole library."
+description: >
+  Point Sonarr's and Radarr's stock Webhook connection at /ArrRefresh/Webhook. On import, upgrade,
+  rename and delete, the plugin resolves only the affected path: it creates or replaces the movie
+  (or the series) under its existing parent, removes items whose files are gone, carries watch state
+  and collection membership across a rename, and queues a metadata refresh for that item alone.
+  Episodes refresh only their Season. Nothing ever re-validates a library root, so large libraries
+  on slow or union filesystems are not walked on every change.
+artifacts:
+- "Jellyfin.Plugin.ArrRefresh.dll"

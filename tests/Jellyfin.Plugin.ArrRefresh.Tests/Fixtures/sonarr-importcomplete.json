@@ -1,0 +1,4 @@
+{"series":{"id":7,"title":"Severance","path":"/data/media/tv/Severance (2022) {tvdb-371980}","tvdbId":371980,"tags":[]},
+ "episodes":[{"id":100,"episodeNumber":1,"seasonNumber":3},{"id":101,"episodeNumber":2,"seasonNumber":3}],
+ "episodeFiles":[{"id":900,"relativePath":"Season 03/S03E01.mkv","path":"/data/media/tv/Severance (2022) {tvdb-371980}/Season 03/S03E01.mkv","languages":[]},{"id":901,"relativePath":"Season 03/S03E02.mkv","path":"/data/media/tv/Severance (2022) {tvdb-371980}/Season 03/S03E02.mkv","languages":[]}],
+ "downloadClient":"SABnzbd","downloadClientType":"SABnzbd","downloadId":"z","sourcePath":"/data/usenet/tv/pack","destinationPath":"/data/media/tv/Severance (2022) {tvdb-371980}","eventType":"Download","instanceName":"Sonarr","applicationUrl":""}

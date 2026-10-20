@@ -1,0 +1,3 @@
+{"movie":{"id":12,"title":"Heat","year":1995,"folderPath":"/data/media/movies/Heat (1995) {tmdb-949}","tmdbId":949,"imdbId":"tt0113277","tags":[]},
+ "renamedMovieFiles":[{"id":501,"relativePath":"Heat (1995) {tmdb-949} [Remux-2160p].mkv","path":"/data/media/movies/Heat (1995) {tmdb-949}/Heat (1995) {tmdb-949} [Remux-2160p].mkv","quality":"Remux-2160p","qualityVersion":1,"size":1,"dateAdded":"2026-10-20T10:00:00Z","languages":[],"previousRelativePath":"Heat (1995) {tmdb-949} [Bluray-2160p].mkv","previousPath":"/data/media/movies/Heat (1995) {tmdb-949}/Heat (1995) {tmdb-949} [Bluray-2160p].mkv"}],
+ "eventType":"Rename","instanceName":"Radarr","applicationUrl":""}

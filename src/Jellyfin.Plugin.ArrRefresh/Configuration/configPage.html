@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Arr Refresh</title>
+</head>
+<body>
+    <div id="ArrRefreshConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-textarea">
+        <div data-role="content">
+            <div class="content-primary">
+                <form id="ArrRefreshConfigForm">
+                    <div class="verticalSection">
+                        <h2 class="sectionTitle">Arr Refresh</h2>
+                        <p>In Sonarr or Radarr, add a <b>Webhook</b> connection (Settings &gt; Connect &gt; + &gt; Webhook):</p>
+                        <ul>
+                            <li><b>URL</b>: <code><span class="arrRefreshUrl"></span>/ArrRefresh/Webhook</code></li>
+                            <li><b>Method</b>: POST</li>
+                            <li><b>Headers</b>: key <code>Authorization</code>, value <code>MediaBrowser Token="&lt;API key&gt;"</code>, using a key from Dashboard &gt; API Keys</li>
+                            <li><b>Triggers</b>: On File Import, On File Upgrade, On Rename, On Movie/Series Delete, On Movie/Episode File Delete</li>
+                        </ul>
+                        <p>Then turn off "Update library" on any Emby/Jellyfin connection in the same app, so changes are not sent twice.</p>
+                    </div>
+                    <div class="inputContainer">
+                        <label class="textareaLabel" for="PathMappings">Path mappings</label>
+                        <textarea is="emby-textarea" id="PathMappings" name="PathMappings" rows="4" class="emby-textarea" placeholder="/data/media => /media"></textarea>
+                        <div class="fieldDescription">One per line: the path as Sonarr/Radarr see it, <code>=&gt;</code>, the path as Jellyfin sees it. Leave empty when both mount the media at the same path.</div>
+                    </div>
+                    <div>
+                        <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+                            <span>Save</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        <script type="text/javascript">
+            var ArrRefreshConfig = {
+                pluginUniqueId: '89c19d1d-6a41-4cc3-aad3-d72b1d32039f'
+            };
+
+            document.querySelector('#ArrRefreshConfigPage')
+                .addEventListener('pageshow', function () {
+                    document.querySelectorAll('.arrRefreshUrl').forEach(function (el) {
+                        el.textContent = ApiClient.serverAddress();
+                    });
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(ArrRefreshConfig.pluginUniqueId).then(function (config) {
+                        document.querySelector('#PathMappings').value = config.PathMappings || '';
+                        Dashboard.hideLoadingMsg();
+                    });
+                });
+
+            document.querySelector('#ArrRefreshConfigForm')
+                .addEventListener('submit', function (e) {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(ArrRefreshConfig.pluginUniqueId).then(function (config) {
+                        config.PathMappings = document.querySelector('#PathMappings').value;
+                        ApiClient.updatePluginConfiguration(ArrRefreshConfig.pluginUniqueId, config).then(function (result) {
+                            Dashboard.processPluginConfigurationUpdateResult(result);
+                        });
+                    });
+
+                    e.preventDefault();
+                    return false;
+                });
+        </script>
+    </div>
+</body>
+</html>

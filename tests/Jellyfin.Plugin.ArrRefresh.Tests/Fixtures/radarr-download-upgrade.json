@@ -1,0 +1,6 @@
+{"movie":{"id":12,"title":"Heat","year":1995,"releaseDate":"1996-02-27","folderPath":"/data/media/movies/Heat (1995) {tmdb-949}","tmdbId":949,"imdbId":"tt0113277","overview":"x","genres":["Crime"],"images":[],"tags":[],"originalLanguage":{"id":1,"name":"English"}},
+ "remoteMovie":{"tmdbId":949,"imdbId":"tt0113277","title":"Heat","year":1995},
+ "movieFile":{"id":501,"relativePath":"Heat (1995) {tmdb-949} [Bluray-2160p][DTS-HD MA 5.1][h265].mkv","path":"/data/media/movies/Heat (1995) {tmdb-949}/Heat (1995) {tmdb-949} [Bluray-2160p][DTS-HD MA 5.1][h265].mkv","quality":"Bluray-2160p","qualityVersion":1,"releaseGroup":"FraMeSToR","sceneName":"Heat.1995","indexerFlags":"0","size":50000000000,"dateAdded":"2026-10-20T10:00:00Z","languages":[{"id":1,"name":"English"}],"sourcePath":"/data/usenet/movies/Heat.1995/heat.mkv"},
+ "isUpgrade":true,"downloadClient":"SABnzbd","downloadClientType":"SABnzbd","downloadId":"SABnzbd_nzo_1",
+ "deletedFiles":[{"id":400,"relativePath":"Heat (1995) {tmdb-949} [Bluray-1080p][AAC 5.1][h265].mkv","path":"/data/media/movies/Heat (1995) {tmdb-949}/Heat (1995) {tmdb-949} [Bluray-1080p][AAC 5.1][h265].mkv","quality":"Bluray-1080p","qualityVersion":1,"size":9000000000,"dateAdded":"2025-01-01T00:00:00Z","languages":[],"recycleBinPath":null}],
+ "eventType":"Download","instanceName":"Radarr","applicationUrl":""}

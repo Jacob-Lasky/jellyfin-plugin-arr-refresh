@@ -1,0 +1,4 @@
+{"series":{"id":7,"title":"Severance","titleSlug":"severance","path":"/data/media/tv/Severance (2022) {tvdb-371980}","tvdbId":371980,"tvMazeId":44933,"tmdbId":95396,"imdbId":"tt11280740","type":"standard","year":2022,"genres":[],"images":[],"tags":[]},
+ "episodes":[{"id":100,"episodeNumber":1,"seasonNumber":3,"title":"Ep","airDate":"2026-10-17","airDateUtc":"2026-10-17T01:00:00Z","seriesId":7,"tvdbId":1}],
+ "episodeFile":{"id":900,"relativePath":"Season 03/Severance (2022) - S03E01 - Ep [WEBDL-2160p].mkv","path":"/data/media/tv/Severance (2022) {tvdb-371980}/Season 03/Severance (2022) - S03E01 - Ep [WEBDL-2160p].mkv","quality":"WEBDL-2160p","qualityVersion":1,"size":1,"dateAdded":"2026-10-20T10:00:00Z","languages":[],"sourcePath":"/data/usenet/tv/x.mkv"},
+ "isUpgrade":false,"downloadClient":"SABnzbd","downloadClientType":"SABnzbd","downloadId":"y","eventType":"Download","instanceName":"Sonarr","applicationUrl":""}

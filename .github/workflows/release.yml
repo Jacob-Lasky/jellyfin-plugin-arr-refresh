@@ -1,0 +1,47 @@
+name: Release
+
+# Push a tag v<Version> (matching Directory.Build.props) to publish: builds, tests, attaches the
+# plugin zip to a GitHub release, and adds that version to manifest.json on main, which is the URL
+# Jellyfin's Plugins > Repositories points at.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+      - name: Check the tag matches the version
+        run: |
+          version=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' Directory.Build.props)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" || { echo "tag is not main's HEAD"; exit 1; }
+      - run: dotnet build -c Release
+      - run: dotnet test -c Release --no-build
+      - run: python3 tests/integration/sandbox_test.py src/Jellyfin.Plugin.ArrRefresh/bin/Release/net10.0/Jellyfin.Plugin.ArrRefresh.dll
+      - name: Package and update the manifest
+        run: |
+          notes=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
+          python3 scripts/package.py src/Jellyfin.Plugin.ArrRefresh/bin/Release/net10.0 \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download" "${notes:-$GITHUB_REF_NAME}"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --title "$GITHUB_REF_NAME" --notes-from-tag
+      - name: Commit the manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add manifest.json
+          git commit -m "manifest: $GITHUB_REF_NAME"
+          git push origin HEAD:main

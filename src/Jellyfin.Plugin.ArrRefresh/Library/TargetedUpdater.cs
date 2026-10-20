@@ -1,0 +1,461 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using Jellyfin.Plugin.ArrRefresh.Planning;
+using MediaBrowser.Controller.Dto;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Library;
+using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.IO;
+using Microsoft.Extensions.Logging;
+
+namespace Jellyfin.Plugin.ArrRefresh.Library;
+
+/// <summary>
+/// Applies a plan to the Jellyfin library: creates, removes and refreshes only the items it names.
+/// </summary>
+public sealed class TargetedUpdater : IDisposable
+{
+    // BaseItem.UpdateFromResolvedItem is internal. It is what a scan calls on an item that is still
+    // there (it records new alternate versions, extra parts, the video type). Calling Jellyfin's own
+    // method keeps one implementation of that rule; DO NOT copy its body here, it would drift.
+    private static readonly MethodInfo? UpdateFromResolvedItem = typeof(BaseItem).GetMethod(
+        "UpdateFromResolvedItem",
+        BindingFlags.Instance | BindingFlags.NonPublic,
+        [typeof(BaseItem)]);
+
+    private readonly ILibraryManager _libraryManager;
+    private readonly IProviderManager _providerManager;
+    private readonly IFileSystem _fileSystem;
+    private readonly IUserManager _userManager;
+    private readonly IUserDataManager _userDataManager;
+    private readonly ILogger<TargetedUpdater> _logger;
+
+    // One webhook at a time: a Download followed by a Rename of the same movie must not interleave.
+    private readonly SemaphoreSlim _gate = new(1, 1);
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="TargetedUpdater"/> class.
+    /// </summary>
+    /// <param name="libraryManager">The library manager.</param>
+    /// <param name="providerManager">The provider manager.</param>
+    /// <param name="fileSystem">The file system.</param>
+    /// <param name="userManager">The user manager.</param>
+    /// <param name="userDataManager">The user data manager.</param>
+    /// <param name="logger">The logger.</param>
+    public TargetedUpdater(
+        ILibraryManager libraryManager,
+        IProviderManager providerManager,
+        IFileSystem fileSystem,
+        IUserManager userManager,
+        IUserDataManager userDataManager,
+        ILogger<TargetedUpdater> logger)
+    {
+        _libraryManager = libraryManager;
+        _providerManager = providerManager;
+        _fileSystem = fileSystem;
+        _userManager = userManager;
+        _userDataManager = userDataManager;
+        _logger = logger;
+        if (UpdateFromResolvedItem is null)
+        {
+            _logger.LogWarning("ArrRefresh: BaseItem.UpdateFromResolvedItem not found in this Jellyfin build; a new alternate version of an existing movie waits for the scheduled scan");
+        }
+    }
+
+    /// <summary>
+    /// Plans and applies the work for a set of paths, as Jellyfin sees them.
+    /// </summary>
+    /// <param name="paths">The paths.</param>
+    /// <param name="context">A label for logs (instance and event type).</param>
+    /// <param name="cancellationToken">Cancels waiting for an earlier webhook; once work starts it runs to the end.</param>
+    /// <returns>One result per step.</returns>
+    public async Task<IReadOnlyList<StepResult>> ApplyAsync(IReadOnlyList<string> paths, string context, CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var plan = new UpdatePlanner(new JellyfinLibraryView(_libraryManager)).Plan(paths);
+
+            // Phase 1: work out every change without writing or queueing anything.
+            var entries = new List<(Diff? Diff, StepResult? Done)>(plan.Count);
+            var folderRefreshes = new List<Guid>();
+            foreach (var step in plan)
+            {
+                switch (step)
+                {
+                    case ReconcileChildStep c:
+                        entries.Add(DiffChild(c));
+                        break;
+                    case RefreshFolderStep r:
+                        folderRefreshes.Add(r.Folder.Id);
+                        entries.Add((null, new StepResult(StepActions.RefreshFolder, r.Folder.Path, StepOutcomes.Ok, [], [], [Describe(r.Folder.Type, r.Folder.Name, r.Folder.Path)], null)));
+                        break;
+                    case SkipStep s:
+                        entries.Add((null, new StepResult(StepActions.Skip, s.Path, StepOutcomes.Skipped, [], [], [], s.Reason)));
+                        break;
+                    default:
+                        throw new InvalidOperationException("Unknown plan step " + step.GetType().Name);
+                }
+            }
+
+            // Phase 2. Not cancellable: an arr that hangs up mid-commit must not leave a replacement
+            // created and the item it replaces still present, or the reverse.
+            await CommitAsync(entries.Select(e => e.Diff).OfType<Diff>().ToList(), CancellationToken.None).ConfigureAwait(false);
+
+            // Exactly what BaseItem.ChangedExternally() queues: RefreshMetadata, then ValidateChildren
+            // of this folder only.
+            foreach (var id in folderRefreshes)
+            {
+                QueueRefresh(id);
+            }
+
+            var results = entries.Select(e => e.Done ?? e.Diff!.ToResult()).ToList();
+            foreach (var result in results)
+            {
+                Log(context, result);
+            }
+
+            return results;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <inheritdoc />
+    public void Dispose() => _gate.Dispose();
+
+    internal static string Describe(BaseItem item) => Describe(item.GetType().Name, item.Name, item.Path);
+
+    private static string Describe(string type, string? name, string? path) => $"{type} '{name}' ({path})";
+
+    private static bool OnDisk(string path) => File.Exists(path) || Directory.Exists(path);
+
+    /// <summary>
+    /// Climbs from an item to its ancestor that is a direct child of <paramref name="parent"/>.
+    /// </summary>
+    private static BaseItem? ChildUnder(Folder parent, BaseItem? item)
+    {
+        // Library depth is a handful of levels (root, series, season, episode, extra); the bound only
+        // stops a corrupt parent cycle from spinning forever.
+        for (var depth = 0; item is not null && depth < 16; depth++)
+        {
+            if (item.ParentId.Equals(parent.Id))
+            {
+                return item;
+            }
+
+            item = item.GetParent();
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Matches each removed item to the created item that replaces it: same type and a shared
+    /// user-data key (tmdb/imdb/tvdb ids the resolver reads from the path, or series plus episode
+    /// number), unique. With <paramref name="allowLoneFallback"/>, a single removal and a single
+    /// creation of the same type also pair, flagged as not keyed.
+    /// </summary>
+    private static List<(BaseItem Old, BaseItem New, bool ByKey)> Pair(IReadOnlyList<BaseItem> removed, IReadOnlyList<BaseItem> created, bool allowLoneFallback)
+    {
+        var pairs = new List<(BaseItem, BaseItem, bool)>();
+        foreach (var old in removed)
+        {
+            var keys = old.GetUserDataKeys().ToHashSet(StringComparer.Ordinal);
+            var matches = created.Where(c => c.GetType() == old.GetType() && c.GetUserDataKeys().Any(keys.Contains)).ToList();
+            if (matches.Count == 1)
+            {
+                pairs.Add((old, matches[0], true));
+            }
+        }
+
+        if (pairs.Count == 0 && allowLoneFallback && removed.Count == 1 && created.Count == 1 && removed[0].GetType() == created[0].GetType())
+        {
+            pairs.Add((removed[0], created[0], false));
+        }
+
+        return pairs;
+    }
+
+    private (Diff? Diff, StepResult? Error) DiffChild(ReconcileChildStep step)
+    {
+        var target = step.ChildPath;
+        StepResult Fail(string detail) => new(StepActions.ReconcileChild, target, StepOutcomes.Error, [], [], [], detail);
+
+        if (_libraryManager.FindByPath(step.ParentPath, true) is not Folder parent)
+        {
+            return (null, Fail($"{step.ParentPath} has no folder item yet; run a library scan once"));
+        }
+
+        // A missing parent means the share is offline, not that everything under it was deleted.
+        if (!Directory.Exists(step.LibraryLocation) || !Directory.Exists(step.ParentPath))
+        {
+            return (null, Fail($"{step.ParentPath} is not accessible; nothing changed"));
+        }
+
+        // Resolve just this one entry exactly as a scan of the parent would (Folder.GetNonCachedChildren),
+        // so item types, ids and ignore rules match what the scheduled scan will later produce.
+        List<BaseItem> resolved;
+        try
+        {
+            resolved = OnDisk(target)
+                ? _libraryManager.ResolvePaths(
+                        [_fileSystem.GetFileSystemInfo(target)],
+                        new DirectoryService(_fileSystem),
+                        parent,
+                        _libraryManager.GetLibraryOptions(parent),
+                        _libraryManager.GetContentType(parent))
+                    .ToList()
+                : [];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return (null, Fail("could not read " + target + ": " + ex.Message));
+        }
+
+        // Existing children of the parent this step may touch: whatever is stored at the webhook's
+        // paths (a renamed or deleted file, an old series folder) and at the resolved ids.
+        var existing = new Dictionary<Guid, BaseItem>();
+        foreach (var path in step.Paths.Append(target).Distinct(PathUtil.Comparer))
+        {
+            if (ChildUnder(parent, _libraryManager.FindByPath(path, null)) is { } item)
+            {
+                existing.TryAdd(item.Id, item);
+            }
+        }
+
+        foreach (var item in resolved)
+        {
+            if (_libraryManager.GetItemById(item.Id) is { } stored)
+            {
+                existing.TryAdd(stored.Id, stored);
+            }
+        }
+
+        // The entry is gone from disk (a movie or series deleted with its folder). A movie folder is
+        // not an item (the Movie's path is its file), so the folder path above found nothing: list
+        // this parent's children from the database, not the disk, and keep those under the target.
+        // StoredColumnsOnly is a cheap listing but must never be saved back, so reload each match.
+        if (resolved.Count == 0)
+        {
+            var children = _libraryManager.GetItemList(new InternalItemsQuery
+            {
+                ParentId = parent.Id,
+                DtoOptions = DtoOptions.StoredColumnsOnly,
+            });
+            foreach (var child in children)
+            {
+                if (child.Path is { } p && PathUtil.IsAtOrUnder(p, target) && _libraryManager.GetItemById(child.Id) is { } stored)
+                {
+                    existing.TryAdd(stored.Id, stored);
+                }
+            }
+        }
+
+        var resolvedIds = resolved.Select(r => r.Id).ToHashSet();
+        var stale = existing.Values.Where(e => !resolvedIds.Contains(e.Id)).ToList();
+
+        // Only remove an item whose own file or folder is really gone. One that still exists but no
+        // longer resolves the same way is left to the scheduled scan rather than guessed at.
+        var removed = stale.Where(e => e.IsFileProtocol && !OnDisk(e.Path)).ToList();
+
+        return (new Diff(
+            parent,
+            target,
+            resolved.Where(r => !existing.ContainsKey(r.Id)).ToList(),
+            resolved.Where(r => existing.ContainsKey(r.Id)).Select(r => (existing[r.Id], r)).ToList(),
+            removed,
+            stale.Except(removed).ToList()), null);
+    }
+
+    private async Task CommitAsync(List<Diff> diffs, CancellationToken cancellationToken)
+    {
+        foreach (var d in diffs.Where(d => d.Created.Count > 0))
+        {
+            foreach (var item in d.Created)
+            {
+                item.SetParent(d.Parent);
+            }
+
+            _libraryManager.CreateItems(d.Created, d.Parent, cancellationToken);
+        }
+
+        // An item that is still there may have gained an alternate version or lost a part.
+        foreach (var (stored, resolved) in diffs.SelectMany(d => d.Kept))
+        {
+            if (UpdateFromResolvedItem?.Invoke(stored, [resolved]) is ItemUpdateType update && update > ItemUpdateType.None)
+            {
+                await stored.UpdateToRepositoryAsync(ItemUpdateType.MetadataImport, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        // The file may have come back (a sync, a remount) since phase 1 looked.
+        foreach (var d in diffs)
+        {
+            foreach (var item in d.Removed.Where(i => OnDisk(i.Path)).ToList())
+            {
+                d.Removed.Remove(item);
+                d.LeftAlone.Add(item);
+            }
+        }
+
+        var allCreated = diffs.SelectMany(d => d.Created).ToList();
+        var allRemoved = diffs.SelectMany(d => d.Removed).ToList();
+
+        // Carry playlist and collection membership, and watch state where Jellyfin's own key-based
+        // reattachment cannot, from each replaced item to its replacement. A scheduled scan does not.
+        var movedDescendants = new List<BaseItem>();
+        foreach (var (old, replacement, byKey) in Pair(allRemoved, allCreated, allowLoneFallback: true))
+        {
+            if (old is Folder oldFolder && replacement is Folder newFolder)
+            {
+                movedDescendants.AddRange(await CarryDescendantsAsync(oldFolder, newFolder).ConfigureAwait(false));
+            }
+
+            await _libraryManager.RerouteLinkedChildReferencesAsync(old.Id, replacement.Id).ConfigureAwait(false);
+            if (!byKey)
+            {
+                CopyUserData(old, replacement, cancellationToken);
+            }
+        }
+
+        foreach (var d in diffs)
+        {
+            foreach (var item in d.Removed)
+            {
+                item.SetParent(null);
+                _libraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation = false }, d.Parent, false);
+            }
+        }
+
+        // Deleting moved the old item's watch state to a placeholder; give it to the item that replaced it.
+        if (allRemoved.Count > 0)
+        {
+            var removedKeys = allRemoved.SelectMany(i => i.GetUserDataKeys()).ToHashSet(StringComparer.Ordinal);
+            foreach (var item in allCreated.Where(c => c.GetUserDataKeys().Any(removedKeys.Contains)))
+            {
+                await item.ReattachUserDataAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            // The moved children were built by a validation pass, so their first metadata refresh may
+            // already have run and will not reattach for them.
+            foreach (var item in movedDescendants)
+            {
+                await item.ReattachUserDataAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        // New items get their first full metadata fetch (and, for a new Series or Season, its
+        // children); kept items are re-probed in case an upgrade reused the same file name.
+        foreach (var item in diffs.SelectMany(d => d.Created.Concat(d.Kept.Select(k => k.Stored))))
+        {
+            QueueRefresh(item.Id);
+        }
+    }
+
+    /// <summary>
+    /// A Series or Season moved to a new folder: build the new one's children now (locally, no
+    /// metadata fetch), then carry each old child's playlist and collection links to its counterpart
+    /// before the old tree is deleted.
+    /// </summary>
+    /// <returns>The new folder's descendants.</returns>
+    private async Task<IReadOnlyList<BaseItem>> CarryDescendantsAsync(Folder oldFolder, Folder newFolder)
+    {
+        var options = new MetadataRefreshOptions(new DirectoryService(_fileSystem))
+        {
+            MetadataRefreshMode = MetadataRefreshMode.ValidationOnly,
+            ImageRefreshMode = MetadataRefreshMode.ValidationOnly,
+        };
+        await newFolder.ValidateChildren(new Progress<double>(), options, recursive: true, allowRemoveRoot: false, CancellationToken.None).ConfigureAwait(false);
+
+        var oldChildren = _libraryManager.GetItemList(new InternalItemsQuery { AncestorIds = [oldFolder.Id], DtoOptions = new DtoOptions(true) });
+        var newChildren = _libraryManager.GetItemList(new InternalItemsQuery { AncestorIds = [newFolder.Id], DtoOptions = new DtoOptions(true) });
+        foreach (var (old, replacement, _) in Pair(oldChildren, newChildren, allowLoneFallback: false))
+        {
+            await _libraryManager.RerouteLinkedChildReferencesAsync(old.Id, replacement.Id).ConfigureAwait(false);
+        }
+
+        return newChildren;
+    }
+
+    /// <summary>
+    /// Copies every user's watch state when old and new item share no user-data key, so Jellyfin's
+    /// placeholder reattachment would never match them.
+    /// </summary>
+    private void CopyUserData(BaseItem old, BaseItem replacement, CancellationToken cancellationToken)
+    {
+        foreach (var user in _userManager.GetUsers())
+        {
+            if (_userDataManager.GetUserData(user, old) is not { } from
+                || (!from.Played && from.PlayCount == 0 && from.PlaybackPositionTicks == 0 && !from.IsFavorite && from.Rating is null && from.Likes is null))
+            {
+                continue;
+            }
+
+            if (_userDataManager.GetUserData(user, replacement) is not { } to)
+            {
+                continue;
+            }
+
+            to.Played = from.Played;
+            to.PlayCount = from.PlayCount;
+            to.PlaybackPositionTicks = from.PlaybackPositionTicks;
+            to.LastPlayedDate = from.LastPlayedDate;
+            to.IsFavorite = from.IsFavorite;
+            to.Rating = from.Rating;
+            to.Likes = from.Likes;
+            to.AudioStreamIndex = from.AudioStreamIndex;
+            to.SubtitleStreamIndex = from.SubtitleStreamIndex;
+            _userDataManager.SaveUserData(user, replacement, to, UserDataSaveReason.Import, cancellationToken);
+        }
+    }
+
+    private void QueueRefresh(Guid id)
+        => _providerManager.QueueRefresh(id, new MetadataRefreshOptions(new DirectoryService(_fileSystem)), RefreshPriority.High);
+
+    private void Log(string context, StepResult r)
+    {
+        if (r.Outcome == StepOutcomes.Error)
+        {
+            _logger.LogWarning("ArrRefresh [{Context}] {Action} {Target}: {Detail}", context, r.Action, r.Target, r.Detail);
+            return;
+        }
+
+        _logger.LogInformation(
+            "ArrRefresh [{Context}] {Action} {Target}: {Outcome}; created {Created}; removed {Removed}; refresh queued {Refreshed}{Detail}",
+            context,
+            r.Action,
+            r.Target,
+            r.Outcome,
+            r.Created.Count == 0 ? "-" : string.Join(", ", r.Created),
+            r.Removed.Count == 0 ? "-" : string.Join(", ", r.Removed),
+            r.Refreshed.Count == 0 ? "-" : string.Join(", ", r.Refreshed),
+            r.Detail is null ? string.Empty : "; " + r.Detail);
+    }
+
+    private sealed record Diff(
+        Folder Parent,
+        string Target,
+        List<BaseItem> Created,
+        List<(BaseItem Stored, BaseItem Resolved)> Kept,
+        List<BaseItem> Removed,
+        List<BaseItem> LeftAlone)
+    {
+        public StepResult ToResult() => new(
+            StepActions.ReconcileChild,
+            Target,
+            StepOutcomes.Ok,
+            Created.Select(Describe).ToList(),
+            Removed.Select(Describe).ToList(),
+            Created.Concat(Kept.Select(k => k.Stored)).Select(Describe).ToList(),
+            LeftAlone.Count == 0 ? null : "left for the scheduled scan (file still exists): " + string.Join("; ", LeftAlone.Select(Describe)));
+    }
+}
