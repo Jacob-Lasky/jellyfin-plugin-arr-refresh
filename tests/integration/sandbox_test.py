@@ -48,6 +48,9 @@ UP = MOVIES + "/Up (2009) {tmdb-14160}"  # gains an alternate version
 BRAZIL = MOVIES + "/Brazil (1985)"  # no id anywhere in its path, so no shared user-data key
 CLUE = MOVIES + "/Clue (1985)"  # deleted while an unrelated movie is added, in one request
 ALIENS = MOVIES + "/Aliens (1986) {tmdb-679}"  # holds the movie and a leftover file at the initial scan
+# A movies library with every remote metadata and image fetcher off: its refresh is a local ffprobe and
+# then silence, so a test can know that no later save of the item will come along and do a retry's job.
+LOCAL = "/data/media/local-movies"
 ANDOR = TV + "/Andor (2022) {tvdb-393189}"
 
 base = token = user_id = meili = None
@@ -176,7 +179,7 @@ def setup(dll):
     sh("docker", "start", NAME)
     ex("mkdir -p /config/plugins/ArrRefresh_it && cp /tmp/plugin.dll /config/plugins/ArrRefresh_it/")
     install_meilisearch_plugin()
-    sh("docker", "exec", "-u", "0", NAME, "sh", "-c", "mkdir -p %s %s %s && chown -R 99:100 /data" % (MOVIES, TV, SHARE))
+    sh("docker", "exec", "-u", "0", NAME, "sh", "-c", "mkdir -p %s %s %s %s && chown -R 99:100 /data" % (MOVIES, TV, SHARE, LOCAL))
     for p in [HEAT + "/Heat (1995) {tmdb-949} [Bluray-1080p].mkv",
               ALIEN + "/Alien (1979) {tmdb-348} [Bluray-1080p].mkv",
               SEV + "/Season 01/Severance (2022) - S01E01 - Good News About Hell.mkv",
@@ -207,6 +210,10 @@ def setup(dll):
     for name, ctype, path in [("Movies", "movies", MOVIES), ("TV", "tvshows", TV), ("Share", "movies", SHARE)]:
         api("POST", "/Library/VirtualFolders?name=%s&collectionType=%s&paths=%s&refreshLibrary=false" % (name, ctype, path),
             {"LibraryOptions": {"EnableRealtimeMonitor": False, "PathInfos": [{"Path": path}]}}, expect=204)
+    api("POST", "/Library/VirtualFolders?name=Local&collectionType=movies&paths=%s&refreshLibrary=false" % LOCAL,
+        {"LibraryOptions": {"EnableRealtimeMonitor": False, "PathInfos": [{"Path": LOCAL}], "EnableInternetProviders": False,
+                            "TypeOptions": [{"Type": "Movie", "MetadataFetchers": [], "MetadataFetcherOrder": [], "ImageFetchers": [], "ImageFetcherOrder": []}]}},
+        expect=204)
     api("POST", "/Library/Refresh", expect=204)
     wait_for("initial scan finds 8 movies and 2 episodes",
              lambda: len(items("Movie")) == 8 and len(items("Episode")) == 2, timeout=180)
@@ -512,11 +519,11 @@ def run():
 
     # Meilisearch down (game mode stops it): the write waits and goes through once it is back.
     sh("docker", "stop", "-t", "10", NAME + "-meili")
-    seven = MOVIES + "/Se7en (1995)/Se7en (1995).mkv"
+    seven = LOCAL + "/Se7en (1995)/Se7en (1995).mkv"
     make_video(seven)
     webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": seven.rsplit("/", 1)[0]}, "movieFile": {"path": seven}})
     wait_for("se7en visible", lambda: seven in paths_of("Movie"))
-    # Stay down until the item's metadata refresh has finished and saved it: otherwise that refresh's
+    # Stay down until the item's (local-only) refresh has finished and saved it: otherwise a later save's
     # own ItemUpdated, arriving after Meilisearch is back, would deliver the document and hide whether
     # the failed write is ever retried.
     # RunTimeTicks is filled by the refresh's ffprobe, network or not (12.2's DTO has no refresh date).
