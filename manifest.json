@@ -3,6 +3,14 @@
     "guid": "89c19d1d-6a41-4cc3-aad3-d72b1d32039f",
     "versions": [
       {
+        "version": "1.1.0.0",
+        "changelog": "Search stays current.\n\n- Items this plugin adds or changes (and the seasons and episodes of a new series) are written to the Meilisearch plugin's search index within seconds, with that plugin's own connection settings and document shape. Nothing else is indexed and no full reindex is run.\n- Each written document is checked again after 45 seconds, 3 and 15 minutes, so one a concurrent rebuild swapped away is written again, and one left for a removed item is deleted.\n- Writes retry with backoff for an hour while Meilisearch is down.\n- Off switch on the settings page.",
+        "targetAbi": "12.2.0.0",
+        "sourceUrl": "https://github.com/Jacob-Lasky/jellyfin-plugin-arr-refresh/releases/download/v1.1.0.0/arr-refresh_1.1.0.0.zip",
+        "checksum": "c32f5302944ba643e2d3df3cb32aec62",
+        "timestamp": "2026-10-20T19:14:44Z"
+      },
+      {
         "version": "1.0.0.0",
         "changelog": "First release.\n\n- Sonarr and Radarr Webhook connections post to /ArrRefresh/Webhook.\n- Imports, upgrades, renames and deletes update only the affected movie, series, season or episode. A library root is never refreshed.\n- Replaced items hand their watch state, playlist entries and collection memberships to their successors, including every episode of a series that moved folders.\n- Nothing is removed while its file exists or its share is offline.\n- POST /ArrRefresh/Paths runs the same work on demand.",
         "targetAbi": "12.2.0.0",
