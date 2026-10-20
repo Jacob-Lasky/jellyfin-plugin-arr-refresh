@@ -32,8 +32,8 @@ namespace Jellyfin.Plugin.ArrRefresh.Search;
 /// container cap on Tower, so it must not run per webhook. Instead this writes just the touched items'
 /// documents, with that plugin's own connection settings.
 /// DO NOT widen this to every ItemAdded/ItemUpdated in the library; only the trees this plugin touched.
-/// All work for an item goes through one table and one worker, in order, so a delete always lands after
-/// any earlier write of the same item, and a document a concurrent rebuild swapped away is written again.
+/// All work for an item goes through one table and one worker, in order, so the item's latest state wins
+/// (a delete lands after any earlier write), and a document a concurrent rebuild swapped away is written again.
 /// </remarks>
 public sealed class SearchIndexSync : IHostedService, IDisposable
 {
@@ -47,9 +47,16 @@ public sealed class SearchIndexSync : IHostedService, IDisposable
 
     // A rebuild that read the database before our write and swapped after it discards the write. On
     // Tower a rebuild takes about 20 s, so look again after 45 s and after 3 minutes.
-    private static readonly TimeSpan[] VerifyAfter = [TimeSpan.FromSeconds(45), TimeSpan.FromMinutes(3)];
+    // A third look covers a rebuild slowed by a large index.
+    private static readonly TimeSpan[] VerifyAfter = [TimeSpan.FromSeconds(45), TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(15)];
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromMinutes(5);
+
+    // A delete has no tracking window of its own; keep trying it this long.
+    private static readonly TimeSpan DeleteRetryFor = TimeSpan.FromHours(1);
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan VerifyTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan IdleWait = TimeSpan.FromSeconds(5);
+    private const int VerifyConcurrency = 8;
     private static readonly TimeSpan ShapeCheckEvery = TimeSpan.FromHours(1);
     private const int MaxBatch = 500;
 
@@ -60,7 +67,8 @@ public sealed class SearchIndexSync : IHostedService, IDisposable
     private readonly ILogger<SearchIndexSync> _logger;
     private readonly ConcurrentDictionary<Guid, DateTime> _tracked = new();
     private readonly ConcurrentDictionary<Guid, Due> _due = new();
-    private readonly SemaphoreSlim _signal = new(0);
+    // At most one pending wake-up: scheduling many items wakes the worker once, not once per item.
+    private readonly SemaphoreSlim _signal = new(0, 1);
     private readonly CancellationTokenSource _stopping = new();
     private Task? _worker;
     private DateTime _shapeCheckedAt = DateTime.MinValue;
@@ -84,7 +92,7 @@ public sealed class SearchIndexSync : IHostedService, IDisposable
         _logger = logger;
     }
 
-    private enum Work
+    internal enum Work
     {
         Verify,
         Upsert,
@@ -172,13 +180,37 @@ public sealed class SearchIndexSync : IHostedService, IDisposable
     private bool IsTracked(Guid id) => _tracked.TryGetValue(id, out var until) && until > DateTime.UtcNow;
 
     /// <summary>
-    /// Records work for an item. A delete supersedes a write, a write supersedes a verification.
+    /// Records work for an item. The latest event wins (a write after a delete is an item that came back
+    /// with the same path-derived id); a verification never replaces pending real work.
     /// </summary>
-    private void Schedule(Guid id, Work kind, TimeSpan after, int attempt)
+    private void Schedule(Guid id, Work kind, TimeSpan after, int attempt, DateTime? until = null)
     {
-        var due = new Due(kind, DateTime.UtcNow + after, attempt);
-        _due.AddOrUpdate(id, due, (_, old) => old.Kind > kind ? old : old.Kind == kind && old.At < due.At ? old : due);
-        _signal.Release();
+        var now = DateTime.UtcNow;
+        var due = new Due(kind, now + after, attempt, until ?? (kind == Work.Delete ? now + DeleteRetryFor : now + TrackFor));
+        _due.AddOrUpdate(id, due, (_, old) => Merge(old, due));
+        Wake();
+    }
+
+    /// <summary>
+    /// Which of two pieces of work for one item to keep: the newer, except that a verification never
+    /// replaces pending real work.
+    /// </summary>
+    /// <param name="pending">The work already scheduled.</param>
+    /// <param name="incoming">The work being scheduled.</param>
+    /// <returns>The work to keep.</returns>
+    internal static Due Merge(Due pending, Due incoming)
+        => incoming.Kind == Work.Verify && pending.Kind != Work.Verify ? pending : incoming;
+
+    private void Wake()
+    {
+        try
+        {
+            _signal.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+            // A wake-up is already pending.
+        }
     }
 
     private async Task RunAsync(CancellationToken cancellationToken)
@@ -187,7 +219,12 @@ public sealed class SearchIndexSync : IHostedService, IDisposable
         {
             try
             {
-                await _signal.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+                var next = _due.IsEmpty ? DateTime.MaxValue : _due.Values.Min(d => d.At);
+                var wait = next == DateTime.MaxValue ? IdleWait : next - DateTime.UtcNow;
+                if (wait > TimeSpan.Zero)
+                {
+                    await _signal.WaitAsync(wait < IdleWait ? wait : IdleWait, cancellationToken).ConfigureAwait(false);
+                }
                 foreach (var expired in _tracked.Where(kv => kv.Value <= DateTime.UtcNow).Select(kv => kv.Key).ToList())
                 {
                     _tracked.TryRemove(expired, out _);
@@ -203,6 +240,11 @@ public sealed class SearchIndexSync : IHostedService, IDisposable
                 if (ready.Count > 0)
                 {
                     await ProcessAsync(ready, cancellationToken).ConfigureAwait(false);
+                }
+
+                if (ready.Count == MaxBatch)
+                {
+                    Wake();
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -235,8 +277,10 @@ public sealed class SearchIndexSync : IHostedService, IDisposable
                 return;
         }
 
-        var deletes = ready.Where(r => r.Value.Kind == Work.Delete).ToList();
-        var upserts = ready.Where(r => r.Value.Kind == Work.Upsert).ToList();
+        // What the library holds NOW decides: an item deleted and then re-created (same path, same id)
+        // is written, not removed.
+        var deletes = ready.Where(r => r.Value.Kind == Work.Delete && _libraryManager.GetItemById(r.Key) is null).ToList();
+        var upserts = ready.Where(r => r.Value.Kind == Work.Upsert || (r.Value.Kind == Work.Delete && !deletes.Contains(r))).ToList();
         var verifies = ready.Where(r => r.Value.Kind == Work.Verify).ToList();
 
         if (upserts.Count > 0)
@@ -263,57 +307,104 @@ public sealed class SearchIndexSync : IHostedService, IDisposable
         if (deletes.Count > 0)
         {
             var ids = deletes.Select(d => d.Key.ToString()).ToList();
-            if (!await SendAsync(http, HttpMethod.Post, index + "/documents/delete-batch", settings.ApiKey, JsonContent.Create(ids), cancellationToken).ConfigureAwait(false))
+            if (await SendAsync(http, HttpMethod.Post, index + "/documents/delete-batch", settings.ApiKey, JsonContent.Create(ids), cancellationToken).ConfigureAwait(false))
+            {
+                // Accepted is not done (Meilisearch applies it as a task): look again, as for writes.
+                foreach (var (id, due) in deletes)
+                {
+                    Schedule(id, Work.Verify, VerifyAfter[0], 0, due.Until);
+                }
+            }
+            else
             {
                 RetryOrDrop(deletes, null);
             }
         }
 
-        foreach (var (id, due) in verifies)
+        await VerifyAsync(http, index, settings.ApiKey, verifies, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Compares each document with the library now: an item without a document is written again (a rebuild
+    /// swapped it away, or the write task failed), a document without an item is deleted again. Runs a few
+    /// at a time with a short timeout, and stops at the first unreachable answer so a stalled server cannot
+    /// hold the worker; the rest are retried later.
+    /// </summary>
+    private async Task VerifyAsync(HttpClient http, string index, string? apiKey, List<KeyValuePair<Guid, Due>> verifies, CancellationToken cancellationToken)
+    {
+        using var unreachable = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var postponed = new ConcurrentBag<KeyValuePair<Guid, Due>>();
+        await Parallel.ForEachAsync(verifies, new ParallelOptions { MaxDegreeOfParallelism = VerifyConcurrency, CancellationToken = cancellationToken }, async (entry, _) =>
         {
-            using var request = Request(HttpMethod.Get, $"{index}/documents/{id}?fields=guid", settings.ApiKey);
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(RequestTimeout);
+            var (id, due) = entry;
+            if (unreachable.IsCancellationRequested)
+            {
+                postponed.Add(entry);
+                return;
+            }
+
             HttpStatusCode status;
             try
             {
+                using var request = Request(HttpMethod.Get, $"{index}/documents/{id}?fields=guid", apiKey);
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(unreachable.Token);
+                timeout.CancelAfter(VerifyTimeout);
                 using var response = await http.SendAsync(request, timeout.Token).ConfigureAwait(false);
                 status = response.StatusCode;
             }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
             {
-                continue;
+                await unreachable.CancelAsync().ConfigureAwait(false);
+                postponed.Add(entry);
+                return;
             }
 
-            if (status == HttpStatusCode.NotFound && _libraryManager.GetItemById(id) is not null)
+            var exists = _libraryManager.GetItemById(id) is not null;
+            if (status == HttpStatusCode.NotFound && exists)
             {
-                _logger.LogInformation("ArrRefresh: search document for {Id} was replaced by a rebuild; writing it again", id);
+                _logger.LogInformation("ArrRefresh: search document for {Id} is missing (replaced by a rebuild?); writing it again", id);
                 Schedule(id, Work.Upsert, TimeSpan.Zero, 0);
             }
-            else if (due.Attempt + 1 < VerifyAfter.Length)
+            else if (status == HttpStatusCode.OK && !exists)
             {
-                Schedule(id, Work.Verify, VerifyAfter[due.Attempt + 1] - VerifyAfter[due.Attempt], due.Attempt + 1);
+                Schedule(id, Work.Delete, TimeSpan.Zero, 0, due.Until);
+            }
+            else if (status is HttpStatusCode.OK or HttpStatusCode.NotFound && due.Attempt + 1 < VerifyAfter.Length)
+            {
+                Schedule(id, Work.Verify, VerifyAfter[due.Attempt + 1] - VerifyAfter[due.Attempt], due.Attempt + 1, due.Until);
+            }
+            else if (status is not (HttpStatusCode.OK or HttpStatusCode.NotFound))
+            {
+                postponed.Add(entry);
+            }
+        }).ConfigureAwait(false);
+
+        // Retried at the same verification step.
+        foreach (var (id, due) in postponed)
+        {
+            if (DateTime.UtcNow < due.Until)
+            {
+                Schedule(id, Work.Verify, TimeSpan.FromMinutes(1), due.Attempt, due.Until);
             }
         }
     }
 
     /// <summary>
-    /// Puts failed work back with exponential backoff. Writes and verifications retry while the item is
-    /// tracked; deletes retry a few times regardless. After that the Meilisearch plugin's next rebuild
-    /// settles it.
+    /// Puts failed work back with exponential backoff (up to 5 minutes) until its deadline: the tracking
+    /// window for writes and verifications, an hour for deletes. After that the Meilisearch plugin's next
+    /// rebuild settles it.
     /// </summary>
     private void RetryOrDrop(IEnumerable<KeyValuePair<Guid, Due>> failed, Work? kind)
     {
         foreach (var (id, due) in failed)
         {
-            var work = kind ?? due.Kind;
-            if ((work != Work.Delete && !IsTracked(id)) || due.Attempt >= 8)
+            if (DateTime.UtcNow >= due.Until)
             {
                 continue;
             }
 
-            var backoff = TimeSpan.FromSeconds(Math.Min(MaxBackoff.TotalSeconds, 5 * Math.Pow(2, due.Attempt)));
-            Schedule(id, work, backoff, due.Attempt + 1);
+            var backoff = TimeSpan.FromSeconds(Math.Min(MaxBackoff.TotalSeconds, 5 * Math.Pow(2, Math.Min(due.Attempt, 10))));
+            Schedule(id, kind ?? due.Kind, backoff, due.Attempt + 1, due.Until);
         }
     }
 
@@ -456,5 +547,12 @@ public sealed class SearchIndexSync : IHostedService, IDisposable
         }
     }
 
-    private sealed record Due(Work Kind, DateTime At, int Attempt);
+    /// <summary>
+    /// A piece of work for one item.
+    /// </summary>
+    /// <param name="Kind">What to do.</param>
+    /// <param name="At">When it is due.</param>
+    /// <param name="Attempt">Retry count, or the verification step.</param>
+    /// <param name="Until">The deadline after which a failure is no longer retried.</param>
+    internal sealed record Due(Work Kind, DateTime At, int Attempt, DateTime Until);
 }

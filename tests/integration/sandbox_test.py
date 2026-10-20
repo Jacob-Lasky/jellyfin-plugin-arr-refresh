@@ -297,6 +297,12 @@ def run():
     ex('rm -r "%s"' % DUNE)
     webhook({"eventType": "MovieDelete", "instanceName": "Radarr", "movie": {"folderPath": DUNE}, "deletedFiles": True})
     check("movie delete: removed", wait_for("movie delete visible", lambda: dune not in paths_of("Movie")))
+    # A delete Meilisearch accepted but did not apply: put the document back by hand. Verification
+    # compares with the library and deletes it again.
+    gone_doc = wait_for("dune document gone", lambda: meili_doc(dune_id) is None and {"guid": "%s-%s-%s-%s-%s" % (dune_id[:8], dune_id[8:12], dune_id[12:16], dune_id[16:20], dune_id[20:]), "name": "Dune", "type": "MediaBrowser.Controller.Entities.Movies.Movie"}, timeout=60)
+    meili_api("POST", "/indexes/%s/documents?primaryKey=guid" % MEILI_INDEX, [gone_doc])
+    wait_for("stale document present", lambda: meili_doc(dune_id) is not None, timeout=30)
+    check("a document left behind for a deleted item is removed by verification", wait_for("stale document removed", lambda: meili_doc(dune_id) is None, timeout=240))
 
     # Sonarr import into an existing season, then a new season.
     e3 = SEV + "/Season 01/Severance (2022) - S01E03 - In Perpetuity.mkv"
