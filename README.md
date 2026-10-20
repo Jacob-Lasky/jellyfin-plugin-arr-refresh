@@ -43,6 +43,26 @@ such as one multi-episode file replacing two episodes, carries nothing, and Jell
 id-based matching decides. Then
 a metadata refresh is queued for each new or changed item, at high priority.
 
+### Search (Meilisearch plugin)
+
+The [Meilisearch plugin](https://github.com/arnesacnussem/jellyfin-plugin-meilisearch) rebuilds its
+index only after a full library scan and on its own schedule. Jellyfin uses Meilisearch's hits
+whenever there are any, so a new movie whose title shares a word with other titles would stay
+unsearchable until that rebuild. When the Meilisearch plugin is installed, Arr Refresh therefore also
+writes the search documents of exactly the items it changed (and of their new seasons and episodes)
+within seconds:
+
+- through Meilisearch's API, with the Meilisearch plugin's own URL, key and index name (including its
+  `MEILI_URL`/`MEILI_MASTER_KEY` overrides and its default index name);
+- in the same 19-field shape that plugin writes, and only while the live index reports that shape;
+  if a new version of that plugin changes it, Arr Refresh stops writing and says so in the log;
+- never as a full reindex, and never for items it did not touch;
+- checked again 45 seconds, 3 minutes and 15 minutes later, so a document that a concurrent rebuild
+  swapped away is written again, and a document left behind for a removed item is deleted;
+- retried with backoff for an hour while Meilisearch is unreachable.
+
+Turn it off on the plugin's settings page.
+
 Rules it keeps:
 
 - **Library roots are never refreshed.** A path that is a library root, or that lies outside every
@@ -111,9 +131,6 @@ Every step is logged with the prefix `ArrRefresh`.
   path mapping.
 - When two libraries share one folder, Jellyfin resolves items there with the first library's
   type and options, during a scan and here alike.
-- With the Meilisearch search plugin, a new item can be browsed and played at once but is found by
-  search only after that plugin's next reindex, which it runs after a full library scan and on its
-  own schedule.
 - Lidarr and Readarr are not handled.
 
 ## Development
