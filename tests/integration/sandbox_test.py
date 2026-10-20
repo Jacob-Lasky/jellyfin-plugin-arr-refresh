@@ -245,9 +245,39 @@ def run():
     make_video(k1)
     webhook({"eventType": "Download", "instanceName": "Sonarr", "series": {"path": ANDOR}, "episodeFile": {"path": k1}})
     check("new series: series and episode appear", wait_for("series visible", lambda: ANDOR in paths_of("Series") and k1 in paths_of("Episode")))
+
+    # A multi-episode file replaces E01 (unwatched) and E02 (watched): the one new item has two
+    # predecessors, so it inherits neither one's history through the plugin.
+    k2 = ANDOR + "/Season 01/Andor (2022) - S01E02 - That Would Be Me.mkv"
+    make_video(k2)
+    webhook({"eventType": "Download", "instanceName": "Sonarr", "series": {"path": ANDOR}, "episodeFile": {"path": k2}})
+    wait_for("second episode visible", lambda: k2 in paths_of("Episode"))
+    api("POST", "/UserPlayedItems/%s?userId=%s" % (next(i["Id"] for i in items("Episode") if i["Path"] == k2), user_id), expect=200)
+    k12 = ANDOR + "/Season 01/Andor (2022) - S01E01-E02 - Kassa + That Would Be Me.mkv"
+    make_video(k12)
+    ex('rm "%s" "%s"' % (k1, k2))
+    webhook({"eventType": "Download", "instanceName": "Sonarr", "series": {"path": ANDOR}, "isUpgrade": True,
+             "episodeFile": {"path": k12}, "deletedFiles": [{"path": k1}, {"path": k2}]})
+    check("multi-episode upgrade: one item replaces both", wait_for("multi-episode visible",
+          lambda: k12 in paths_of("Episode") and not {k1, k2} & paths_of("Episode")))
+    time.sleep(5)
+    check("multi-episode upgrade: E02's watch state was not merged onto the combined item",
+          not next(i for i in items("Episode") if i["Path"] == k12)["UserData"]["Played"])
+
+    # An episode renumbered into another season: the new season is not the old one.
+    s1 = next(i for i in items("Season") if i["Path"] == ANDOR + "/Season 01")
+    seasons = api("POST", "/Collections?name=Seasons&ids=%s" % s1["Id"], expect=200)[1]["Id"]
+    k12b = ANDOR + "/Season 02/Andor (2022) - S02E01-E02 - Kassa + That Would Be Me.mkv"
+    ex('mkdir -p "%s/Season 02" && mv "%s" "%s" && rmdir "%s/Season 01"' % (ANDOR, k12, k12b, ANDOR))
+    webhook({"eventType": "Rename", "instanceName": "Sonarr", "series": {"path": ANDOR},
+             "renamedEpisodeFiles": [{"path": k12b, "previousPath": k12}]})
+    check("season renumber: new season present, old gone", wait_for("season renumber visible",
+          lambda: ANDOR + "/Season 02" in paths_of("Season") and ANDOR + "/Season 01" not in paths_of("Season")))
+    in_seasons = [i["Path"] for i in api("GET", "/Items?ParentId=%s&Fields=Path" % seasons, expect=200)[1]["Items"]]
+    check("season renumber: Season 01's collection entry did not move to Season 02", ANDOR + "/Season 02" not in in_seasons)
     ex('rm -r "%s"' % ANDOR)
     webhook({"eventType": "SeriesDelete", "instanceName": "Sonarr", "series": {"path": ANDOR}, "deletedFiles": True})
-    check("series delete: series and episodes gone", wait_for("series delete visible", lambda: ANDOR not in paths_of("Series") and k1 not in paths_of("Episode")))
+    check("series delete: series and episodes gone", wait_for("series delete visible", lambda: ANDOR not in paths_of("Series") and k12b not in paths_of("Episode")))
 
     # A whole series moved to a new folder (Sonarr renames the series folder): every episode keeps
     # its watch state and its collection membership.
@@ -283,6 +313,14 @@ def run():
     check("new primary version: step is skipped for the scheduled scan", [s["Outcome"] for s in steps] == ["skipped"] and "primary version" in (steps[0]["Detail"] or ""))
     time.sleep(3)
     check("new primary version: no duplicate movie was created", up_sources()[0] == 1)
+    # Now the 1080p primary is deleted in the same upgrade: its item goes (Jellyfin promotes the 720p
+    # version), the 2160p hand-over is still left to the scan, and there is never a second primary.
+    ex('rm "%s"' % up1080)
+    steps = webhook({"eventType": "Download", "instanceName": "Radarr", "isUpgrade": True, "movie": {"folderPath": UP},
+                     "movieFile": {"path": up2160}, "deletedFiles": [{"path": up1080}]})["Steps"]
+    check("promotion with deletion: deleted primary removed, step deferred", [s["Outcome"] for s in steps] == ["skipped"] and len(steps[0]["Removed"]) == 1)
+    time.sleep(3)
+    check("promotion with deletion: exactly one primary remains, on the 720p file", up_sources() == (1, [up720]))
 
     # Two unrelated paths in one request (one movie deleted, another added) never trade history.
     clue_id = next(i["Id"] for i in items("Movie") if i["Path"].startswith(CLUE))

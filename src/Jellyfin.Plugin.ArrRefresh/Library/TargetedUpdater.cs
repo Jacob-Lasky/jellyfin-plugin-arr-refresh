@@ -170,17 +170,22 @@ public sealed class TargetedUpdater : IDisposable
     /// Matches each removed item to the created item that replaces it. First by what the arr said
     /// (a rename or upgrade pair whose old path is at or under the removed item and whose new path is
     /// at or under the created one), then by a shared user-data key (tmdb/imdb/tvdb ids the resolver
-    /// reads from the path). Only unique matches of the same type pair. There is deliberately no
+    /// reads from the path). Only matches that are unique in both directions pair. There is deliberately no
     /// "one removed, one created" guess: two unrelated paths in one request must never trade history.
     /// </summary>
     private static List<(BaseItem Old, BaseItem New, bool SharesKey)> Pair(IReadOnlyList<BaseItem> removed, IReadOnlyList<BaseItem> created, IReadOnlyList<PathReplacement> replacements)
     {
-        var pairs = new List<(BaseItem, BaseItem, bool)>();
+        var pairs = new List<(BaseItem Old, BaseItem New, bool SharesKey)>();
         foreach (var old in removed)
         {
             var keys = old.GetUserDataKeys().ToHashSet(StringComparer.Ordinal);
             bool SharesKey(BaseItem c) => c.GetUserDataKeys().Any(keys.Contains);
-            var sameType = created.Where(c => c.GetType() == old.GetType()).ToList();
+
+            // Same type, and where both already know their number (a Season always does), the same
+            // number: an episode moved from Season 01 to Season 02 must not make the seasons one.
+            var sameType = created
+                .Where(c => c.GetType() == old.GetType() && !(c.IndexNumber.HasValue && old.IndexNumber.HasValue && c.IndexNumber != old.IndexNumber))
+                .ToList();
 
             var byArr = sameType
                 .Where(c => replacements.Any(r => Covers(old.Path, r.Old) && Covers(c.Path, r.New)))
@@ -192,7 +197,9 @@ public sealed class TargetedUpdater : IDisposable
             }
         }
 
-        return pairs;
+        // One new item claimed by several old ones (a multi-episode file replacing E01 and E02) has no
+        // single predecessor: carry nothing to it and let Jellyfin's key-based reattachment decide.
+        return pairs.GroupBy(p => p.New.Id).Where(g => g.Count() == 1).Select(g => g.Single()).ToList();
 
         static bool Covers(string? itemPath, string path) => itemPath is not null && PathUtil.IsAtOrUnder(path, itemPath);
     }
@@ -236,14 +243,17 @@ public sealed class TargetedUpdater : IDisposable
         // A new file that outranks an existing version (2160p beside 1080p) becomes the primary and
         // demotes the old one. Jellyfin's scan has dedicated, private logic for that hand-over; doing
         // half of it here would leave two primaries. Leave the whole entry to the scheduled scan.
-        foreach (var video in resolved.OfType<Video>())
+        // Only a NEW primary displaces anything; a kept primary that gains an alternate is updated below.
+        string? promotion = null;
+        foreach (var video in resolved.OfType<Video>().Where(v => _libraryManager.GetItemById(v.Id) is null))
         {
             var displaced = (video.LocalAlternateVersions ?? [])
-                .Select(alt => _libraryManager.FindByPath(alt, false))
-                .FirstOrDefault(i => i is not null && !i.Id.Equals(video.Id) && !resolved.Any(r => r.Id.Equals(i.Id)));
+                .Select(FindAnyByPath)
+                .FirstOrDefault(i => i is not null && !resolved.Any(r => r.Id.Equals(i.Id)));
             if (displaced is not null)
             {
-                return (null, new StepResult(StepActions.ReconcileChild, target, StepOutcomes.Skipped, [], [], [], $"{video.Path} becomes the primary version over {displaced.Path}; left for the scheduled scan, which promotes versions"));
+                promotion = $"{video.Path} would become the primary version over {displaced.Path}; left for the scheduled scan, which promotes versions";
+                break;
             }
         }
 
@@ -293,13 +303,38 @@ public sealed class TargetedUpdater : IDisposable
         // longer resolves the same way is left to the scheduled scan rather than guessed at.
         var removed = stale.Where(e => e.IsFileProtocol && !OnDisk(e.Path)).ToList();
 
+        if (promotion is not null)
+        {
+            // Still drop items whose files are gone (Jellyfin's DeleteItem promotes the next version
+            // itself), but create and update nothing; the scan then makes the new file primary.
+            return (new Diff(parent, target, [], [], removed, stale.Except(removed).ToList(), promotion), null);
+        }
+
         return (new Diff(
             parent,
             target,
             resolved.Where(r => !existing.ContainsKey(r.Id)).ToList(),
             resolved.Where(r => existing.ContainsKey(r.Id)).Select(r => (existing[r.Id], r)).ToList(),
             removed,
-            stale.Except(removed).ToList()), null);
+            stale.Except(removed).ToList(),
+            null), null);
+    }
+
+    /// <summary>
+    /// Finds any item stored at exactly this path, including the owned alternate versions that
+    /// <see cref="ILibraryManager.FindByPath"/> hides.
+    /// </summary>
+    private BaseItem? FindAnyByPath(string path)
+    {
+        var found = _libraryManager.GetItemList(new InternalItemsQuery
+        {
+            Path = path,
+            IncludeOwnedItems = true,
+            IncludeAlternateVersions = true,
+            Limit = 1,
+            DtoOptions = new DtoOptions(true),
+        });
+        return found.Count > 0 ? found[0] : null;
     }
 
     private async Task CommitAsync(List<Diff> diffs, IReadOnlyList<PathReplacement> replacements, CancellationToken cancellationToken)
@@ -324,27 +359,28 @@ public sealed class TargetedUpdater : IDisposable
         }
 
         var allCreated = diffs.SelectMany(d => d.Created).ToList();
-        var allRemoved = diffs.SelectMany(d => d.Removed).ToList();
+        var pairs = Pair(diffs.SelectMany(d => d.Removed).ToList(), allCreated, replacements)
+            .ToDictionary(p => p.Old.Id);
 
-        // Carry playlist and collection membership, and watch state where Jellyfin's own key-based
-        // reattachment cannot, from each replaced item to its replacement. A scheduled scan does not.
-        var movedDescendants = new List<BaseItem>();
-        foreach (var (old, replacement, sharesKey) in Pair(allRemoved, allCreated, replacements))
+        // Build the children of each new Series or Season now (locally, no metadata fetch), so the old
+        // tree's children have counterparts to hand their links to.
+        var newChildrenOf = new Dictionary<Guid, IReadOnlyList<BaseItem>>();
+        foreach (var (old, replacement, _) in pairs.Values)
         {
-            if (old is Folder oldFolder && replacement is Folder newFolder)
+            if (old is Folder && replacement is Folder newFolder)
             {
-                movedDescendants.AddRange(await CarryDescendantsAsync(oldFolder, newFolder, replacements, cancellationToken).ConfigureAwait(false));
+                newChildrenOf[newFolder.Id] = await BuildChildrenAsync(newFolder).ConfigureAwait(false);
             }
-
-            await CarryAsync(old, replacement, sharesKey, cancellationToken).ConfigureAwait(false);
         }
 
+        // Per removed item, back to back: confirm its file is still gone (a sync or remount may have
+        // brought it back since phase 1), carry what hangs off it to its replacement, delete it.
+        var actuallyRemoved = new List<BaseItem>();
+        var movedDescendants = new List<BaseItem>();
         foreach (var d in diffs)
         {
             foreach (var item in d.Removed.ToList())
             {
-                // Checked again here, after the work above: the file may have come back (a sync, a
-                // remount) since phase 1 looked, and then its item must stay.
                 if (OnDisk(item.Path))
                 {
                     d.Removed.Remove(item);
@@ -352,15 +388,32 @@ public sealed class TargetedUpdater : IDisposable
                     continue;
                 }
 
+                if (pairs.TryGetValue(item.Id, out var pair))
+                {
+                    if (newChildrenOf.TryGetValue(pair.New.Id, out var newChildren))
+                    {
+                        var oldChildren = _libraryManager.GetItemList(new InternalItemsQuery { AncestorIds = [item.Id], DtoOptions = new DtoOptions(true) });
+                        foreach (var (oldChild, newChild, childSharesKey) in Pair(oldChildren, newChildren, replacements))
+                        {
+                            await CarryAsync(oldChild, newChild, childSharesKey, cancellationToken).ConfigureAwait(false);
+                        }
+
+                        movedDescendants.AddRange(newChildren);
+                    }
+
+                    await CarryAsync(item, pair.New, pair.SharesKey, cancellationToken).ConfigureAwait(false);
+                }
+
                 item.SetParent(null);
                 _libraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation = false }, d.Parent, false);
+                actuallyRemoved.Add(item);
             }
         }
 
         // Deleting moved the old item's watch state to a placeholder; give it to the item that replaced it.
-        if (allRemoved.Count > 0)
+        if (actuallyRemoved.Count > 0)
         {
-            var removedKeys = allRemoved.SelectMany(i => i.GetUserDataKeys()).ToHashSet(StringComparer.Ordinal);
+            var removedKeys = actuallyRemoved.SelectMany(i => i.GetUserDataKeys()).ToHashSet(StringComparer.Ordinal);
             foreach (var item in allCreated.Where(c => c.GetUserDataKeys().Any(removedKeys.Contains)))
             {
                 await item.ReattachUserDataAsync(cancellationToken).ConfigureAwait(false);
@@ -383,12 +436,10 @@ public sealed class TargetedUpdater : IDisposable
     }
 
     /// <summary>
-    /// A Series or Season moved to a new folder: build the new one's children now (locally, no
-    /// metadata fetch), then carry each old child's playlist and collection links to its counterpart
-    /// before the old tree is deleted.
+    /// A Series or Season moved to a new folder: build the new one's children with a local validation
+    /// pass (no metadata fetch) and return them.
     /// </summary>
-    /// <returns>The new folder's descendants.</returns>
-    private async Task<IReadOnlyList<BaseItem>> CarryDescendantsAsync(Folder oldFolder, Folder newFolder, IReadOnlyList<PathReplacement> replacements, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<BaseItem>> BuildChildrenAsync(Folder newFolder)
     {
         var options = new MetadataRefreshOptions(new DirectoryService(_fileSystem))
         {
@@ -396,15 +447,7 @@ public sealed class TargetedUpdater : IDisposable
             ImageRefreshMode = MetadataRefreshMode.ValidationOnly,
         };
         await newFolder.ValidateChildren(new Progress<double>(), options, recursive: true, allowRemoveRoot: false, CancellationToken.None).ConfigureAwait(false);
-
-        var oldChildren = _libraryManager.GetItemList(new InternalItemsQuery { AncestorIds = [oldFolder.Id], DtoOptions = new DtoOptions(true) });
-        var newChildren = _libraryManager.GetItemList(new InternalItemsQuery { AncestorIds = [newFolder.Id], DtoOptions = new DtoOptions(true) });
-        foreach (var (old, replacement, sharesKey) in Pair(oldChildren, newChildren, replacements))
-        {
-            await CarryAsync(old, replacement, sharesKey, cancellationToken).ConfigureAwait(false);
-        }
-
-        return newChildren;
+        return _libraryManager.GetItemList(new InternalItemsQuery { AncestorIds = [newFolder.Id], DtoOptions = new DtoOptions(true) });
     }
 
     /// <summary>
@@ -427,7 +470,8 @@ public sealed class TargetedUpdater : IDisposable
     /// </summary>
     private void CopyUserData(BaseItem old, BaseItem replacement, CancellationToken cancellationToken)
     {
-        static bool HasState(UserItemData d) => d.Played || d.PlayCount > 0 || d.PlaybackPositionTicks > 0 || d.IsFavorite || d.Rating is not null || d.Likes is not null;
+        static bool HasState(UserItemData d) => d.Played || d.PlayCount > 0 || d.PlaybackPositionTicks > 0 || d.IsFavorite
+            || d.Rating is not null || d.Likes is not null || d.AudioStreamIndex is not null || d.SubtitleStreamIndex is not null;
 
         foreach (var user in _userManager.GetUsers())
         {
@@ -483,15 +527,20 @@ public sealed class TargetedUpdater : IDisposable
         List<BaseItem> Created,
         List<(BaseItem Stored, BaseItem Resolved)> Kept,
         List<BaseItem> Removed,
-        List<BaseItem> LeftAlone)
+        List<BaseItem> LeftAlone,
+        string? Deferred)
     {
         public StepResult ToResult() => new(
             StepActions.ReconcileChild,
             Target,
-            StepOutcomes.Ok,
+            Deferred is null ? StepOutcomes.Ok : StepOutcomes.Skipped,
             Created.Select(Describe).ToList(),
             Removed.Select(Describe).ToList(),
             Created.Concat(Kept.Select(k => k.Stored)).Select(Describe).ToList(),
-            LeftAlone.Count == 0 ? null : "left for the scheduled scan (file still exists): " + string.Join("; ", LeftAlone.Select(Describe)));
+            string.Join(
+                "; ",
+                new[] { Deferred, LeftAlone.Count == 0 ? null : "left for the scheduled scan (file still exists): " + string.Join("; ", LeftAlone.Select(Describe)) }
+                    .OfType<string>())
+                is { Length: > 0 } detail ? detail : null);
     }
 }
