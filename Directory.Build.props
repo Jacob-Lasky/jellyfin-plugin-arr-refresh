@@ -1,7 +1,7 @@
 <Project>
   <PropertyGroup>
     <!-- The one place the plugin version lives. build.yaml, the manifest and the release tag are derived from it. -->
-    <Version>1.0.0.0</Version>
+    <Version>1.1.0.0</Version>
     <AssemblyVersion>$(Version)</AssemblyVersion>
     <FileVersion>$(Version)</FileVersion>
     <TargetFramework>net10.0</TargetFramework>
