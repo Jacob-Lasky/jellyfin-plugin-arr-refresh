@@ -9,6 +9,7 @@ using Jellyfin.Plugin.ArrRefresh.Planning;
 using Jellyfin.Plugin.ArrRefresh.Webhooks;
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Entities;
@@ -170,7 +171,8 @@ public sealed class TargetedUpdater : IDisposable
     /// Matches each removed item to the created item that replaces it. First by what the arr said
     /// (a rename or upgrade pair whose old path is at or under the removed item and whose new path is
     /// at or under the created one), then by a shared user-data key (tmdb/imdb/tvdb ids the resolver
-    /// reads from the path). Only matches that are unique in both directions pair. There is deliberately no
+    /// reads from the path). Each old item needs a unique match; a new item may take several old ones
+    /// only if they are files of one movie (never episodes or folders). There is deliberately no
     /// "one removed, one created" guess: two unrelated paths in one request must never trade history.
     /// </summary>
     private static List<(BaseItem Old, BaseItem New, bool SharesKey)> Pair(IReadOnlyList<BaseItem> removed, IReadOnlyList<BaseItem> created, IReadOnlyList<PathReplacement> replacements)
@@ -197,9 +199,18 @@ public sealed class TargetedUpdater : IDisposable
             }
         }
 
-        // One new item claimed by several old ones (a multi-episode file replacing E01 and E02) has no
-        // single predecessor: carry nothing to it and let Jellyfin's key-based reattachment decide.
-        return pairs.GroupBy(p => p.New.Id).Where(g => g.Count() == 1).Select(g => g.Single()).ToList();
+        // Several old items may hand over to one new item only when they are files of one movie: every
+        // file a Radarr upgrade deletes belongs to the movie it imported for, ids in the name or not.
+        // Episodes replaced by one multi-episode file are distinct episodes, and folders are distinct
+        // seasons or shows, so there is no single predecessor: carry nothing and let Jellyfin's
+        // key-based reattachment decide. DO NOT judge this by IndexNumber or by shared keys: an episode
+        // imported moments earlier has no number until its first refresh, and a leftover file whose
+        // name carries no id shares no key with the movie it belongs to.
+        return pairs
+            .GroupBy(p => p.New.Id)
+            .Where(g => g.Count() == 1 || g.All(p => p.Old is not Episode && p.Old is not Folder))
+            .SelectMany(g => g)
+            .ToList();
 
         static bool Covers(string? itemPath, string path) => itemPath is not null && PathUtil.IsAtOrUnder(path, itemPath);
     }
@@ -243,13 +254,18 @@ public sealed class TargetedUpdater : IDisposable
         // A new file that outranks an existing version (2160p beside 1080p) becomes the primary and
         // demotes the old one. Jellyfin's scan has dedicated, private logic for that hand-over; doing
         // half of it here would leave two primaries. Leave the whole entry to the scheduled scan.
-        // Only a NEW primary displaces anything; a kept primary that gains an alternate is updated below.
+        // An existing version that is not already this primary's own (owned by it, or marked as its
+        // version) would be taken over. Judge by ownership, not by whether the primary's id is stored:
+        // ids derive from paths, so a stale row for a file that came back would look "kept".
         string? promotion = null;
-        foreach (var video in resolved.OfType<Video>().Where(v => _libraryManager.GetItemById(v.Id) is null))
+        foreach (var video in resolved.OfType<Video>())
         {
             var displaced = (video.LocalAlternateVersions ?? [])
                 .Select(FindAnyByPath)
-                .FirstOrDefault(i => i is not null && !resolved.Any(r => r.Id.Equals(i.Id)));
+                .FirstOrDefault(i => i is not null
+                    && !resolved.Any(r => r.Id.Equals(i.Id))
+                    && !i.OwnerId.Equals(video.Id)
+                    && !(i is Video v && v.PrimaryVersionId.Equals(video.Id)));
             if (displaced is not null)
             {
                 promotion = $"{video.Path} would become the primary version over {displaced.Path}; left for the scheduled scan, which promotes versions";

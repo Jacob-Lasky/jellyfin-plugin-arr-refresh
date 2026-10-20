@@ -204,6 +204,24 @@ def run():
     steps = webhook(upgrade)["Steps"]
     check("upgrade replayed: idempotent (nothing created or removed)", all(not s["Created"] and not s["Removed"] for s in steps))
 
+    # An upgrade that also deletes a leftover file Jellyfin listed as its own movie: both old items
+    # hand their collection entries to the one new file.
+    leftover = ALIEN + "/leftover.mkv"
+    make_video(leftover)
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": ALIEN}, "movieFile": {"path": leftover}})
+    wait_for("leftover visible", lambda: leftover in paths_of("Movie"))
+    by_path = {i["Path"]: i["Id"] for i in items("Movie")}
+    aliens = api("POST", "/Collections?name=Aliens&ids=%s,%s" % (by_path[a_new], by_path[leftover]), expect=200)[1]["Id"]
+    a_hdr = ALIEN + "/Alien (1979) {tmdb-348} [Remux-2160p][HDR].mkv"
+    make_video(a_hdr)
+    ex('rm "%s" "%s"' % (a_new, leftover))
+    webhook({"eventType": "Download", "instanceName": "Radarr", "isUpgrade": True, "movie": {"folderPath": ALIEN},
+             "movieFile": {"path": a_hdr}, "deletedFiles": [{"path": a_new}, {"path": leftover}]})
+    check("two-file upgrade: only the new file remains", wait_for("two-file upgrade visible",
+          lambda: a_hdr in paths_of("Movie") and not {a_new, leftover} & paths_of("Movie")))
+    in_aliens = [i["Path"] for i in api("GET", "/Items?ParentId=%s&Fields=Path" % aliens, expect=200)[1]["Items"]]
+    check("two-file upgrade: collection entries carried to the new file", in_aliens == [a_hdr])
+
     # Radarr whole-movie delete: only the folder path is in the payload.
     ex('rm -r "%s"' % DUNE)
     webhook({"eventType": "MovieDelete", "instanceName": "Radarr", "movie": {"folderPath": DUNE}, "deletedFiles": True})
@@ -309,6 +327,8 @@ def run():
     make_video(up720)
     webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": UP}, "movieFile": {"path": up720}})
     check("alternate version: recorded on the existing movie", wait_for("alternate version visible", lambda: up_sources() == (1, sorted([up1080, up720]))))
+    steps = webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": UP}, "movieFile": {"path": up720}})["Steps"]
+    check("alternate version replayed: the primary's own version is not mistaken for a takeover", [s["Outcome"] for s in steps] == ["ok"])
     # A higher one would take over as primary; that hand-over is left to the scheduled scan.
     make_video(up2160)
     steps = webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": UP}, "movieFile": {"path": up2160}})["Steps"]
@@ -385,7 +405,12 @@ def main():
         run()
     finally:
         if failures:
-            print(sh("docker", "logs", "--tail", "60", NAME, check=False))
+            out = subprocess.run(["docker", "logs", NAME], capture_output=True, text=True)
+            log_path = os.path.join(os.environ.get("IT_LOG_DIR", "/tmp"), NAME + ".log")
+            with open(log_path, "w") as f:
+                f.write(out.stdout + out.stderr)
+            print("full server log:", log_path)
+            print("\n".join((out.stdout + out.stderr).splitlines()[-60:]))
         subprocess.run(["docker", "rm", "-fv", NAME], capture_output=True)  # -v: the image's anonymous /config and /cache volumes
     print("\n%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
