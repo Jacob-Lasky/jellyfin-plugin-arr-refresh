@@ -53,6 +53,20 @@ public class UpdatePlannerTests
     }
 
     [Fact]
+    public void A_folder_row_with_no_parent_is_not_a_live_folder_so_its_path_is_reconciled_under_its_real_parent()
+    {
+        var view = new FakeView();
+        var ghost = view.AddFolder(Show, "Series") with { Attached = false };
+        view.Folders[Show] = ghost;
+        var step = Reconcile(Assert.Single(new UpdatePlanner(view).Plan([Show])));
+        Assert.Equal(Tv, step.ParentPath);
+        Assert.Equal(Show, step.ChildPath);
+
+        var episode = Reconcile(Assert.Single(new UpdatePlanner(view).Plan([Show + "/Season 01/S01E01.mkv"])));
+        Assert.Equal(Tv, episode.ParentPath); // not under the detached series row
+    }
+
+    [Fact]
     public void A_movie_moved_to_a_new_folder_reconciles_both_folders()
     {
         var plan = new UpdatePlanner(new FakeView()).Plan([Movies + "/Heat (1994)/a.mkv", Heat + "/a.mkv"]);

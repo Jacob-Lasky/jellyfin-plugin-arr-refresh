@@ -23,6 +23,7 @@ import re
 import select
 import signal
 import socket
+import sqlite3
 import tempfile
 import zipfile
 import subprocess
@@ -282,11 +283,58 @@ def paths_of(types):
     return {i["Path"] for i in items(types)}
 
 
+def server_log():
+    out = subprocess.run(["docker", "logs", NAME], capture_output=True, text=True)
+    return out.stdout + out.stderr
+
+
 def root_validations():
     """Lines showing a library root being re-validated: the walk this plugin exists to prevent."""
-    out = subprocess.run(["docker", "logs", NAME], capture_output=True, text=True)
-    log = out.stdout + out.stderr
-    return [line for line in log.splitlines() if "will be refreshed" in line or "Validating media library" in line]
+    return [line for line in server_log().splitlines() if "will be refreshed" in line or "Validating media library" in line]
+
+
+def db_rows(sql, *args):
+    """Query a copy of the sandbox's database: the only view of an item the API does not list (one with no parent)."""
+    with tempfile.TemporaryDirectory() as d:
+        for ext in ("", "-wal", "-shm"):
+            subprocess.run(["docker", "cp", NAME + ":/config/data/jellyfin.db" + ext, os.path.join(d, "jellyfin.db" + ext)],
+                           capture_output=True)
+        db = sqlite3.connect(os.path.join(d, "jellyfin.db"))
+        try:
+            return db.execute(sql, args).fetchall()
+        finally:
+            db.close()
+
+
+def remove_during_refresh(library, title, take_offline=False, before_release=None):
+    """Create a movie and remove it through the plugin while the refresh the plugin queued for it is still
+    running, then let that refresh finish. ffprobe is held on a FIFO in place of the file until then.
+
+    With take_offline, the library location is moved away after the removal and before the refresh
+    finishes, as an unmounted share would be; the caller puts it back. before_release(path) runs after
+    the removal, while the refresh is still held.
+    """
+    folder = library + "/" + title
+    path = folder + "/" + title + " [Bluray-1080p].mkv"
+    make_video("/tmp/held-source.mkv")
+    ex('mkdir -p "%s" && mkfifo "%s"' % (folder, path))
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": folder}, "movieFile": {"path": path}})
+    wait_for("held visible", lambda: path in paths_of("Movie"))
+    item_id = next(i["Id"] for i in items("Movie") if i["Path"] == path)
+    wait_for("its refresh is held in ffprobe", lambda: any("ffprobe" in p and title in p for p in processes_in_sandbox().splitlines()))
+    ex('mkdir -p /tmp/away && mv "%s" /tmp/away/held.fifo && rmdir "%s"' % (path, folder))
+    webhook({"eventType": "MovieDelete", "instanceName": "Radarr", "movie": {"folderPath": folder}, "deletedFiles": True})
+    if take_offline:
+        ex('mv "%s" "%s-offline"' % (library, library))
+    if before_release:
+        before_release(path)
+    ex("timeout 30 sh -c 'cat /tmp/held-source.mkv > /tmp/away/held.fifo'")  # the refresh runs to its end
+    return {"path": path, "id": item_id}
+
+
+def processes_in_sandbox():
+    """Command lines of the processes running in the sandbox, read from /proc (the image has no ps)."""
+    return sh("docker", "exec", NAME, "sh", "-c", 'for p in /proc/[0-9]*; do tr "\\0" " " < $p/cmdline 2>/dev/null; echo; done', check=False)
 
 
 def meili_api(method, path, body=None):
@@ -771,6 +819,50 @@ def run():
     wait_for("Meilisearch back", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
     seven_id = next(i["Id"] for i in items("Movie") if i["Path"] == seven)
     check("Meilisearch outage: the write is retried and lands once it is back", wait_for("se7en document", lambda: meili_doc(seven_id), timeout=180) is not None)
+
+    # A movie removed while its first metadata refresh is still running ends up saved back by that refresh,
+    # with no parent: a row the API never lists and no scan visits, but that search still finds. The plugin
+    # must remove it again. (An item saved back WITH its parent and its share offline is left alone; that
+    # branch of the rule is unit-tested, since no refresh here can be made to keep the parent.)
+    held = remove_during_refresh(MOVIES, "Held (2004) {tmdb-12345}")
+    check("removed during its own refresh: the refresh saved it back and the plugin removed it again",
+          wait_for("removed again", lambda: held["path"] + ") was saved back" in server_log(), timeout=30) is not None)  # promptly, not by the 1-minute look
+    check("removed during its own refresh: no row is left", wait_for("held row gone", lambda: not db_rows("SELECT 1 FROM BaseItems WHERE Path = ?", held["path"])) is not None)
+    check("removed during its own refresh: no search document is left", wait_for("held document gone", lambda: meili_doc(held["id"]) is None) is not None)
+    # The same file imported again inside the watch: a real item again (same id, since ids come from paths).
+    make_video(held["path"])
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": held["path"].rsplit("/", 1)[0]}, "movieFile": {"path": held["path"]}})
+    wait_for("held imported again", lambda: held["path"] in paths_of("Movie"))
+    time.sleep(15)  # well past the plugin's settle delay
+    check("imported again after it was removed: kept", held["path"] in paths_of("Movie"))
+    # Even with its share offline: a row with no parent is never a real item.
+    offline = remove_during_refresh(SHARE, "Kept (2005) {tmdb-12346}", take_offline=True)
+    check("saved back while its share is offline: removed again all the same",
+          wait_for("offline row gone", lambda: offline["path"] + ") was saved back" in server_log()
+                   and not db_rows("SELECT 1 FROM BaseItems WHERE Path = ?", offline["path"])) is not None)
+    ex('mv "%s-offline" "%s"' % (SHARE, SHARE))
+    # Imported again while the row saved back is still there (before the plugin's second look): the import
+    # must give the row its parent back, not keep it as it is, invisible.
+    again = remove_during_refresh(MOVIES, "Again (2006) {tmdb-12347}")
+    wait_for("the refresh saved it back", lambda: db_rows("SELECT 1 FROM BaseItems WHERE Path = ? AND ParentId IS NULL", again["path"]))
+    make_video(again["path"])
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": again["path"].rsplit("/", 1)[0]}, "movieFile": {"path": again["path"]}})
+    check("imported again over the row saved back: listed", wait_for("again listed", lambda: again["path"] in paths_of("Movie")) is not None)
+    time.sleep(15)  # well past the plugin's settle delay
+    check("imported again over the row saved back: still listed", again["path"] in paths_of("Movie"))
+    # Imported again while the old refresh is still held, which finishes only after the plugin has looked
+    # at the re-import and judged it real: the old refresh's stale save then overwrites the new row with no
+    # parent. The plugin must still be watching, and must reconcile the path, not remove the item.
+    def import_again(path):
+        make_video(path)
+        webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": path.rsplit("/", 1)[0]}, "movieFile": {"path": path}})
+        wait_for("over listed before the release", lambda: path in paths_of("Movie"))
+        time.sleep(12)  # past the plugin's settle delay: the re-import is judged before the stale save lands
+    over = remove_during_refresh(MOVIES, "Over (2007) {tmdb-12348}", before_release=import_again)
+    check("re-imported during the old refresh: its stale save is reconciled",
+          wait_for("reconciled", lambda: over["path"] + ") was saved back with no parent over a file that exists" in server_log(), timeout=30) is not None)
+    check("re-imported during the old refresh: listed, with its parent", wait_for("over listed", lambda: over["path"] in paths_of("Movie")
+          and db_rows("SELECT 1 FROM BaseItems WHERE Path = ? AND ParentId IS NOT NULL", over["path"])) is not None)
 
     steps = api("POST", "/ArrRefresh/Paths", {"Paths": [MOVIES, TV + "/", "/etc/passwd"]}, expect=200)[1]["Steps"]
     check("library roots and outside paths are skipped", [s["Action"] for s in steps] == ["Skip", "Skip", "Skip"])

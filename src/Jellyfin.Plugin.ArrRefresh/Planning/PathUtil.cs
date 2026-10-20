@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 
 namespace Jellyfin.Plugin.ArrRefresh.Planning;
 
@@ -41,6 +43,15 @@ internal static class PathUtil
             return null;
         }
     }
+
+    /// <summary>
+    /// The library location that holds a path: the most specific one, when locations nest.
+    /// </summary>
+    /// <param name="path">A normalised path.</param>
+    /// <param name="locations">Normalised library locations.</param>
+    /// <returns>The location, or null when none holds the path.</returns>
+    public static string? LocationOf(string path, IEnumerable<string> locations) =>
+        locations.Where(l => IsAtOrUnder(path, l)).MaxBy(l => l.Length);
 
     /// <summary>
     /// Whether <paramref name="path"/> is <paramref name="root"/> or lies under it, on a whole-segment boundary.

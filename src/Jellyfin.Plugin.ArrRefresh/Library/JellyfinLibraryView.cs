@@ -41,9 +41,15 @@ internal sealed class JellyfinLibraryView : ILibraryView
         }
 
         return _libraryManager.FindByPath(path, true) is Folder folder and not AggregateFolder and not CollectionFolder and not UserRootFolder
-            ? new FolderRef(folder.Id, path, folder.GetType().Name, folder.Name)
+            ? new FolderRef(folder.Id, path, folder.GetType().Name, folder.Name, IsAttached(folder))
             : null;
     }
 
-    public bool Exists(string path) => File.Exists(path) || Directory.Exists(path);
+    public bool Exists(string path) => OnDisk(path);
+
+    /// <summary>Whether a file or directory is at the path.</summary>
+    internal static bool OnDisk(string path) => File.Exists(path) || Directory.Exists(path);
+
+    /// <summary>Whether an item is in the tree: it has a parent or, for an extra or a merged version, an owner.</summary>
+    internal static bool IsAttached(BaseItem item) => !item.ParentId.Equals(Guid.Empty) || !item.OwnerId.Equals(Guid.Empty);
 }

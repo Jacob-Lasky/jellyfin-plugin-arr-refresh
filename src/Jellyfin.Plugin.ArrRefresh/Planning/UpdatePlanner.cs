@@ -65,9 +65,7 @@ public sealed class UpdatePlanner
     /// <returns>The steps: reconciles, then folder refreshes, then skips, each deduplicated.</returns>
     public IReadOnlyList<PlanStep> Plan(IEnumerable<string> paths)
     {
-        var locations = _view.LibraryLocations
-            .OrderByDescending(l => l.Length)
-            .ToList();
+        var locations = _view.LibraryLocations;
 
         var skips = new List<PlanStep>();
         var refreshes = new Dictionary<Guid, (FolderRef Folder, List<string> Paths)>();
@@ -82,7 +80,7 @@ public sealed class UpdatePlanner
                 continue;
             }
 
-            var location = locations.FirstOrDefault(l => PathUtil.IsAtOrUnder(path, l));
+            var location = PathUtil.LocationOf(path, locations);
             if (location is null)
             {
                 skips.Add(new SkipStep(path, "not inside any Jellyfin library location"));
@@ -97,7 +95,7 @@ public sealed class UpdatePlanner
 
             // The webhook named a folder that is itself a live item (a series kept on disk after a
             // delete in the arr, a series being added): refresh that folder.
-            if (_view.FindFolderItem(path) is { } named && _view.Exists(path))
+            if (LiveFolder(path) is { } named)
             {
                 if (!refreshes.TryGetValue(named.Id, out var refresh))
                 {
@@ -154,11 +152,14 @@ public sealed class UpdatePlanner
     /// directory that is both a folder item and still on disk. A folder item whose directory is gone is
     /// passed over, so its removal is reconciled one level up.
     /// </summary>
+    private FolderRef? LiveFolder(string path) =>
+        _view.FindFolderItem(path) is { Attached: true } folder && _view.Exists(path) ? folder : null;
+
     private string? NearestLiveFolder(string path, string location)
     {
         for (var current = Path.GetDirectoryName(path); current is not null && current.Length > location.Length; current = Path.GetDirectoryName(current))
         {
-            if (_view.FindFolderItem(current) is not null && _view.Exists(current))
+            if (LiveFolder(current) is not null)
             {
                 return current;
             }
