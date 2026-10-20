@@ -26,6 +26,11 @@ public class ArrWebhookParserTests
                 Movies + "/Heat (1995) {tmdb-949} [Bluray-1080p][AAC 5.1][h265].mkv",
             ],
             e.Paths);
+        Assert.Equal(
+            [new PathReplacement(
+                Movies + "/Heat (1995) {tmdb-949} [Bluray-1080p][AAC 5.1][h265].mkv",
+                Movies + "/Heat (1995) {tmdb-949} [Bluray-2160p][DTS-HD MA 5.1][h265].mkv")],
+            e.Replacements);
     }
 
     [Fact]
@@ -39,6 +44,7 @@ public class ArrWebhookParserTests
                 Movies + "/Heat (1995) {tmdb-949} [Remux-2160p].mkv",
             ],
             e.Paths);
+        Assert.Equal([new PathReplacement(Movies + "/Heat (1995) {tmdb-949} [Bluray-2160p].mkv", Movies + "/Heat (1995) {tmdb-949} [Remux-2160p].mkv")], e.Replacements);
     }
 
     [Fact]
@@ -75,6 +81,7 @@ public class ArrWebhookParserTests
         Assert.Equal(ArrSource.Sonarr, e.Source);
         Assert.Equal(ArrEventKind.Apply, e.Kind);
         Assert.Equal([Series + "/Season 03/Severance (2022) - S03E01 - Ep [WEBDL-2160p].mkv"], e.Paths);
+        Assert.Empty(e.Replacements);
     }
 
     [Fact]
@@ -96,6 +103,12 @@ public class ArrWebhookParserTests
                 Series + "/Season 01/Severance (2022) - S01E02 - Half Loop.mkv",
             ],
             e.Paths);
+        Assert.Equal(
+            [
+                new PathReplacement(Series + "/Season 01/S01E01.mkv", Series + "/Season 01/Severance (2022) - S01E01 - Good News About Hell.mkv"),
+                new PathReplacement(Series + "/Season 01/S01E02.mkv", Series + "/Season 01/Severance (2022) - S01E02 - Half Loop.mkv"),
+            ],
+            e.Replacements);
     }
 
     [Fact]
@@ -116,6 +129,23 @@ public class ArrWebhookParserTests
         var e = ArrWebhookParser.Parse("""{"EventType":"download","Movie":{"FolderPath":"/m/A"},"MovieFile":{"Path":"/m/A/a.mkv"},"DeletedFiles":[{"Path":"/m/A/a.mkv"}]}""");
         Assert.Equal(ArrSource.Radarr, e.Source);
         Assert.Equal(["/m/A/a.mkv"], e.Paths);
+    }
+
+    [Fact]
+    public void Sonarr_upgrade_pairs_each_replaced_file_with_the_imported_one()
+    {
+        var e = ArrWebhookParser.Parse("""{"eventType":"Download","series":{"path":"/tv/S"},"episodeFile":{"path":"/tv/S/Season 01/new.mkv"},"deletedFiles":[{"path":"/tv/S/Season 01/old.mkv"},{"path":"/tv/S/Season 01/old2.mkv"}]}""");
+        Assert.Equal(
+            [new PathReplacement("/tv/S/Season 01/old.mkv", "/tv/S/Season 01/new.mkv"), new PathReplacement("/tv/S/Season 01/old2.mkv", "/tv/S/Season 01/new.mkv")],
+            e.Replacements);
+    }
+
+    [Fact]
+    public void Sonarr_import_without_a_file_is_ignored_rather_than_refreshing_the_series()
+    {
+        var e = ArrWebhookParser.Parse("""{"eventType":"Download","series":{"path":"/tv/S"}}""");
+        Assert.Equal(ArrEventKind.Ignored, e.Kind);
+        Assert.Empty(e.Paths);
     }
 
     [Fact]

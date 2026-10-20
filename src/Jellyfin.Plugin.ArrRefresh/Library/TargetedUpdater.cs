@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.ArrRefresh.Planning;
+using Jellyfin.Plugin.ArrRefresh.Webhooks;
 using MediaBrowser.Controller.Dto;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
@@ -72,11 +73,18 @@ public sealed class TargetedUpdater : IDisposable
     /// Plans and applies the work for a set of paths, as Jellyfin sees them.
     /// </summary>
     /// <param name="paths">The paths.</param>
+    /// <param name="replacements">Old-to-new file pairs the arr reported, as Jellyfin sees them; they decide which new item inherits an old one's history.</param>
     /// <param name="context">A label for logs (instance and event type).</param>
     /// <param name="cancellationToken">Cancels waiting for an earlier webhook; once work starts it runs to the end.</param>
     /// <returns>One result per step.</returns>
-    public async Task<IReadOnlyList<StepResult>> ApplyAsync(IReadOnlyList<string> paths, string context, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<StepResult>> ApplyAsync(IReadOnlyList<string> paths, IReadOnlyList<PathReplacement> replacements, string context, CancellationToken cancellationToken)
     {
+        var normalizedReplacements = replacements
+            .Select(r => (Old: PathUtil.Normalize(r.Old), New: PathUtil.Normalize(r.New)))
+            .Where(r => r.Old is not null && r.New is not null)
+            .Select(r => new PathReplacement(r.Old!, r.New!))
+            .ToList();
+
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -106,7 +114,7 @@ public sealed class TargetedUpdater : IDisposable
 
             // Phase 2. Not cancellable: an arr that hangs up mid-commit must not leave a replacement
             // created and the item it replaces still present, or the reverse.
-            await CommitAsync(entries.Select(e => e.Diff).OfType<Diff>().ToList(), CancellationToken.None).ConfigureAwait(false);
+            await CommitAsync(entries.Select(e => e.Diff).OfType<Diff>().ToList(), normalizedReplacements, CancellationToken.None).ConfigureAwait(false);
 
             // Exactly what BaseItem.ChangedExternally() queues: RefreshMetadata, then ValidateChildren
             // of this folder only.
@@ -159,30 +167,34 @@ public sealed class TargetedUpdater : IDisposable
     }
 
     /// <summary>
-    /// Matches each removed item to the created item that replaces it: same type and a shared
-    /// user-data key (tmdb/imdb/tvdb ids the resolver reads from the path, or series plus episode
-    /// number), unique. With <paramref name="allowLoneFallback"/>, a single removal and a single
-    /// creation of the same type also pair, flagged as not keyed.
+    /// Matches each removed item to the created item that replaces it. First by what the arr said
+    /// (a rename or upgrade pair whose old path is at or under the removed item and whose new path is
+    /// at or under the created one), then by a shared user-data key (tmdb/imdb/tvdb ids the resolver
+    /// reads from the path). Only unique matches of the same type pair. There is deliberately no
+    /// "one removed, one created" guess: two unrelated paths in one request must never trade history.
     /// </summary>
-    private static List<(BaseItem Old, BaseItem New, bool ByKey)> Pair(IReadOnlyList<BaseItem> removed, IReadOnlyList<BaseItem> created, bool allowLoneFallback)
+    private static List<(BaseItem Old, BaseItem New, bool SharesKey)> Pair(IReadOnlyList<BaseItem> removed, IReadOnlyList<BaseItem> created, IReadOnlyList<PathReplacement> replacements)
     {
         var pairs = new List<(BaseItem, BaseItem, bool)>();
         foreach (var old in removed)
         {
             var keys = old.GetUserDataKeys().ToHashSet(StringComparer.Ordinal);
-            var matches = created.Where(c => c.GetType() == old.GetType() && c.GetUserDataKeys().Any(keys.Contains)).ToList();
+            bool SharesKey(BaseItem c) => c.GetUserDataKeys().Any(keys.Contains);
+            var sameType = created.Where(c => c.GetType() == old.GetType()).ToList();
+
+            var byArr = sameType
+                .Where(c => replacements.Any(r => Covers(old.Path, r.Old) && Covers(c.Path, r.New)))
+                .ToList();
+            var matches = byArr.Count > 0 ? byArr : sameType.Where(SharesKey).ToList();
             if (matches.Count == 1)
             {
-                pairs.Add((old, matches[0], true));
+                pairs.Add((old, matches[0], SharesKey(matches[0])));
             }
         }
 
-        if (pairs.Count == 0 && allowLoneFallback && removed.Count == 1 && created.Count == 1 && removed[0].GetType() == created[0].GetType())
-        {
-            pairs.Add((removed[0], created[0], false));
-        }
-
         return pairs;
+
+        static bool Covers(string? itemPath, string path) => itemPath is not null && PathUtil.IsAtOrUnder(path, itemPath);
     }
 
     private (Diff? Diff, StepResult? Error) DiffChild(ReconcileChildStep step)
@@ -219,6 +231,20 @@ public sealed class TargetedUpdater : IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return (null, Fail("could not read " + target + ": " + ex.Message));
+        }
+
+        // A new file that outranks an existing version (2160p beside 1080p) becomes the primary and
+        // demotes the old one. Jellyfin's scan has dedicated, private logic for that hand-over; doing
+        // half of it here would leave two primaries. Leave the whole entry to the scheduled scan.
+        foreach (var video in resolved.OfType<Video>())
+        {
+            var displaced = (video.LocalAlternateVersions ?? [])
+                .Select(alt => _libraryManager.FindByPath(alt, false))
+                .FirstOrDefault(i => i is not null && !i.Id.Equals(video.Id) && !resolved.Any(r => r.Id.Equals(i.Id)));
+            if (displaced is not null)
+            {
+                return (null, new StepResult(StepActions.ReconcileChild, target, StepOutcomes.Skipped, [], [], [], $"{video.Path} becomes the primary version over {displaced.Path}; left for the scheduled scan, which promotes versions"));
+            }
         }
 
         // Existing children of the parent this step may touch: whatever is stored at the webhook's
@@ -276,7 +302,7 @@ public sealed class TargetedUpdater : IDisposable
             stale.Except(removed).ToList()), null);
     }
 
-    private async Task CommitAsync(List<Diff> diffs, CancellationToken cancellationToken)
+    private async Task CommitAsync(List<Diff> diffs, IReadOnlyList<PathReplacement> replacements, CancellationToken cancellationToken)
     {
         foreach (var d in diffs.Where(d => d.Created.Count > 0))
         {
@@ -297,40 +323,35 @@ public sealed class TargetedUpdater : IDisposable
             }
         }
 
-        // The file may have come back (a sync, a remount) since phase 1 looked.
-        foreach (var d in diffs)
-        {
-            foreach (var item in d.Removed.Where(i => OnDisk(i.Path)).ToList())
-            {
-                d.Removed.Remove(item);
-                d.LeftAlone.Add(item);
-            }
-        }
-
         var allCreated = diffs.SelectMany(d => d.Created).ToList();
         var allRemoved = diffs.SelectMany(d => d.Removed).ToList();
 
         // Carry playlist and collection membership, and watch state where Jellyfin's own key-based
         // reattachment cannot, from each replaced item to its replacement. A scheduled scan does not.
         var movedDescendants = new List<BaseItem>();
-        foreach (var (old, replacement, byKey) in Pair(allRemoved, allCreated, allowLoneFallback: true))
+        foreach (var (old, replacement, sharesKey) in Pair(allRemoved, allCreated, replacements))
         {
             if (old is Folder oldFolder && replacement is Folder newFolder)
             {
-                movedDescendants.AddRange(await CarryDescendantsAsync(oldFolder, newFolder).ConfigureAwait(false));
+                movedDescendants.AddRange(await CarryDescendantsAsync(oldFolder, newFolder, replacements, cancellationToken).ConfigureAwait(false));
             }
 
-            await _libraryManager.RerouteLinkedChildReferencesAsync(old.Id, replacement.Id).ConfigureAwait(false);
-            if (!byKey)
-            {
-                CopyUserData(old, replacement, cancellationToken);
-            }
+            await CarryAsync(old, replacement, sharesKey, cancellationToken).ConfigureAwait(false);
         }
 
         foreach (var d in diffs)
         {
-            foreach (var item in d.Removed)
+            foreach (var item in d.Removed.ToList())
             {
+                // Checked again here, after the work above: the file may have come back (a sync, a
+                // remount) since phase 1 looked, and then its item must stay.
+                if (OnDisk(item.Path))
+                {
+                    d.Removed.Remove(item);
+                    d.LeftAlone.Add(item);
+                    continue;
+                }
+
                 item.SetParent(null);
                 _libraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation = false }, d.Parent, false);
             }
@@ -367,7 +388,7 @@ public sealed class TargetedUpdater : IDisposable
     /// before the old tree is deleted.
     /// </summary>
     /// <returns>The new folder's descendants.</returns>
-    private async Task<IReadOnlyList<BaseItem>> CarryDescendantsAsync(Folder oldFolder, Folder newFolder)
+    private async Task<IReadOnlyList<BaseItem>> CarryDescendantsAsync(Folder oldFolder, Folder newFolder, IReadOnlyList<PathReplacement> replacements, CancellationToken cancellationToken)
     {
         var options = new MetadataRefreshOptions(new DirectoryService(_fileSystem))
         {
@@ -378,29 +399,44 @@ public sealed class TargetedUpdater : IDisposable
 
         var oldChildren = _libraryManager.GetItemList(new InternalItemsQuery { AncestorIds = [oldFolder.Id], DtoOptions = new DtoOptions(true) });
         var newChildren = _libraryManager.GetItemList(new InternalItemsQuery { AncestorIds = [newFolder.Id], DtoOptions = new DtoOptions(true) });
-        foreach (var (old, replacement, _) in Pair(oldChildren, newChildren, allowLoneFallback: false))
+        foreach (var (old, replacement, sharesKey) in Pair(oldChildren, newChildren, replacements))
         {
-            await _libraryManager.RerouteLinkedChildReferencesAsync(old.Id, replacement.Id).ConfigureAwait(false);
+            await CarryAsync(old, replacement, sharesKey, cancellationToken).ConfigureAwait(false);
         }
 
         return newChildren;
     }
 
     /// <summary>
-    /// Copies every user's watch state when old and new item share no user-data key, so Jellyfin's
-    /// placeholder reattachment would never match them.
+    /// Moves what hangs off the old item to its replacement: playlist and collection entries always,
+    /// and watch state when the two share no user-data key (Jellyfin's own reattachment matches by
+    /// key, so without one it would never find them).
+    /// </summary>
+    private async Task CarryAsync(BaseItem old, BaseItem replacement, bool sharesKey, CancellationToken cancellationToken)
+    {
+        await _libraryManager.RerouteLinkedChildReferencesAsync(old.Id, replacement.Id).ConfigureAwait(false);
+        if (!sharesKey)
+        {
+            CopyUserData(old, replacement, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Copies every user's watch state from old to replacement, but only into a replacement that has
+    /// none yet, so playback that already happened on the new item is never overwritten.
     /// </summary>
     private void CopyUserData(BaseItem old, BaseItem replacement, CancellationToken cancellationToken)
     {
+        static bool HasState(UserItemData d) => d.Played || d.PlayCount > 0 || d.PlaybackPositionTicks > 0 || d.IsFavorite || d.Rating is not null || d.Likes is not null;
+
         foreach (var user in _userManager.GetUsers())
         {
-            if (_userDataManager.GetUserData(user, old) is not { } from
-                || (!from.Played && from.PlayCount == 0 && from.PlaybackPositionTicks == 0 && !from.IsFavorite && from.Rating is null && from.Likes is null))
+            if (_userDataManager.GetUserData(user, old) is not { } from || !HasState(from))
             {
                 continue;
             }
 
-            if (_userDataManager.GetUserData(user, replacement) is not { } to)
+            if (_userDataManager.GetUserData(user, replacement) is not { } to || HasState(to))
             {
                 continue;
             }

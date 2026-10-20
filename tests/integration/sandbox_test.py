@@ -31,6 +31,7 @@ TERM = SHARE + "/The Terminal (2004) {tmdb-594}"
 PLUGIN_ID = "89c19d1d-6a41-4cc3-aad3-d72b1d32039f"
 UP = MOVIES + "/Up (2009) {tmdb-14160}"  # gains an alternate version
 BRAZIL = MOVIES + "/Brazil (1985)"  # no id anywhere in its path, so no shared user-data key
+CLUE = MOVIES + "/Clue (1985)"  # deleted while an unrelated movie is added, in one request
 ANDOR = TV + "/Andor (2022) {tvdb-393189}"
 
 base = token = user_id = None
@@ -122,7 +123,8 @@ def setup(dll):
               SEV + "/Season 01/Severance (2022) - S01E02 - Half Loop.mkv",
               TERM + "/The Terminal (2004) {tmdb-594} [DVD].mkv",
               UP + "/Up (2009) {tmdb-14160} - 1080p.mkv",
-              BRAZIL + "/Brazil (1985).mkv"]:
+              BRAZIL + "/Brazil (1985).mkv",
+              CLUE + "/Clue (1985).mkv"]:
         make_video(p)
     sh("docker", "restart", "-t", "30", NAME)  # load the plugin copied in after the first start
     ip = sh("docker", "inspect", NAME, "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}")
@@ -140,8 +142,8 @@ def setup(dll):
         api("POST", "/Library/VirtualFolders?name=%s&collectionType=%s&paths=%s&refreshLibrary=false" % (name, ctype, path),
             {"LibraryOptions": {"EnableRealtimeMonitor": False, "PathInfos": [{"Path": path}]}}, expect=204)
     api("POST", "/Library/Refresh", expect=204)
-    wait_for("initial scan finds 5 movies and 2 episodes",
-             lambda: len(items("Movie")) == 5 and len(items("Episode")) == 2, timeout=180)
+    wait_for("initial scan finds 6 movies and 2 episodes",
+             lambda: len(items("Movie")) == 6 and len(items("Episode")) == 2, timeout=180)
 
 
 def _public_ok():
@@ -217,19 +219,23 @@ def run():
     webhook({"eventType": "Download", "instanceName": "Sonarr", "series": {"path": SEV}, "episodeFiles": [{"path": p} for p in s2]})
     check("new season: both episodes appear", wait_for("season visible", lambda: set(s2) <= paths_of("Episode")))
 
-    # Sonarr rename keeps watch state; file delete removes one episode.
+    # Sonarr renames two episodes in one event: each keeps its own watch state and playlist entry.
     e1_old = SEV + "/Season 01/Severance (2022) - S01E01 - Good News About Hell.mkv"
     e1_new = SEV + "/Season 01/Severance (2022) - S01E01 - Good News About Hell [WEBDL-1080p].mkv"
-    e1_id = next(i["Id"] for i in items("Episode") if i["Path"] == e1_old)
-    api("POST", "/UserPlayedItems/%s?userId=%s" % (e1_id, user_id), expect=200)
-    playlist = api("POST", "/Playlists", {"Name": "Queue", "Ids": [e1_id], "UserId": user_id}, expect=200)[1]["Id"]
-    ex('mv "%s" "%s"' % (e1_old, e1_new))
+    e2_old = SEV + "/Season 01/Severance (2022) - S01E02 - Half Loop.mkv"
+    e2_new = SEV + "/Season 01/Severance (2022) - S01E02 - Half Loop [WEBDL-1080p].mkv"
+    ids = {i["Path"]: i["Id"] for i in items("Episode")}
+    api("POST", "/UserPlayedItems/%s?userId=%s" % (ids[e1_old], user_id), expect=200)
+    playlist = api("POST", "/Playlists", {"Name": "Queue", "Ids": [ids[e1_old], ids[e2_old]], "UserId": user_id}, expect=200)[1]["Id"]
+    ex('mv "%s" "%s" && mv "%s" "%s"' % (e1_old, e1_new, e2_old, e2_new))
     webhook({"eventType": "Rename", "instanceName": "Sonarr", "series": {"path": SEV},
-             "renamedEpisodeFiles": [{"path": e1_new, "previousPath": e1_old}]})
-    check("episode rename: new path only", wait_for("episode rename visible", lambda: e1_new in paths_of("Episode") and e1_old not in paths_of("Episode")))
-    check("episode rename: watch state carried over", next(i for i in items("Episode") if i["Path"] == e1_new)["UserData"]["Played"])
+             "renamedEpisodeFiles": [{"path": e1_new, "previousPath": e1_old}, {"path": e2_new, "previousPath": e2_old}]})
+    check("episode rename: new paths only", wait_for("episode rename visible",
+          lambda: {e1_new, e2_new} <= paths_of("Episode") and not {e1_old, e2_old} & paths_of("Episode")))
+    played = {i["Path"]: i["UserData"]["Played"] for i in items("Episode")}
+    check("episode rename: each episode keeps its own watch state", played[e1_new] and not played[e2_new])
     in_playlist = [i["Path"] for i in api("GET", "/Playlists/%s/Items?userId=%s&Fields=Path" % (playlist, user_id), expect=200)[1]["Items"]]
-    check("episode rename: playlist membership carried over", in_playlist == [e1_new])
+    check("episode rename: both playlist entries carried over, in order", in_playlist == [e1_new, e2_new])
     ex('rm "%s"' % e3)
     webhook({"eventType": "EpisodeFileDelete", "instanceName": "Sonarr", "series": {"path": SEV}, "episodeFile": {"path": e3}})
     check("episode file delete: removed", wait_for("episode delete visible", lambda: e3 not in paths_of("Episode")))
@@ -245,28 +251,48 @@ def run():
 
     # A whole series moved to a new folder (Sonarr renames the series folder): every episode keeps
     # its watch state and its collection membership.
-    e2 = SEV + "/Season 01/Severance (2022) - S01E02 - Half Loop.mkv"
-    e2_id = next(i["Id"] for i in items("Episode") if i["Path"] == e2)
-    api("POST", "/UserPlayedItems/%s?userId=%s" % (e2_id, user_id), expect=200)
-    shows = api("POST", "/Collections?name=Shows&ids=%s" % e2_id, expect=200)[1]["Id"]
-    sev2 = TV + "/Severance (US) (2022) {tvdb-371980}"
+    # The new folder carries no {tvdb-...}, so old and new share no user-data key: only the arr's
+    # own rename pairs say which new episode is which old one.
+    e2 = e2_new
+    api("POST", "/UserPlayedItems/%s?userId=%s" % (next(i["Id"] for i in items("Episode") if i["Path"] == e2), user_id), expect=200)
+    shows = api("POST", "/Collections?name=Shows&ids=%s" % next(i["Id"] for i in items("Episode") if i["Path"] == e2), expect=200)[1]["Id"]
+    sev2 = TV + "/Severance (US) (2022)"
     ex('mv "%s" "%s"' % (SEV, sev2))
-    e2_new = e2.replace(SEV, sev2)
+    moved = {p: p.replace(SEV, sev2) for p in (e1_new, e2)}
     webhook({"eventType": "Rename", "instanceName": "Sonarr", "series": {"path": sev2},
-             "renamedEpisodeFiles": [{"path": e2_new, "previousPath": e2}]})
+             "renamedEpisodeFiles": [{"path": n, "previousPath": o} for o, n in moved.items()]})
     check("series move: new series folder only", wait_for("series move visible", lambda: sev2 in paths_of("Series") and SEV not in paths_of("Series")))
-    check("series move: episode watch state carried over", wait_for("moved episode played", lambda: any(i["Path"] == e2_new and i["UserData"]["Played"] for i in items("Episode"))))
+    check("series move: every episode keeps its watch state", wait_for("moved episodes played",
+          lambda: all(any(i["Path"] == moved[p] and i["UserData"]["Played"] for i in items("Episode")) for p in moved)))
     in_shows = [i["Path"] for i in api("GET", "/Items?ParentId=%s&Fields=Path" % shows, expect=200)[1]["Items"]]
-    check("series move: episode collection membership carried over", in_shows == [e2_new])
+    check("series move: episode collection membership carried over", in_shows == [moved[e2]])
+    in_playlist = [i["Path"] for i in api("GET", "/Playlists/%s/Items?userId=%s&Fields=Path" % (playlist, user_id), expect=200)[1]["Items"]]
+    check("series move: playlist entries carried over", in_playlist == [moved[e1_new], moved[e2]])
 
-    # A second version dropped beside an existing movie is recorded on that movie.
-    up4k = UP + "/Up (2009) {tmdb-14160} - 2160p.mkv"
-    make_video(up4k)
-    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": UP}, "movieFile": {"path": up4k}})
-    def up_versions():
+    # A lower version dropped beside an existing movie is recorded on that (still primary) movie.
+    def up_sources():
         up = [i for i in api("GET", "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources", expect=200)[1]["Items"] if i["Path"].startswith(UP)]
-        return len(up) == 1 and len(up[0].get("MediaSources", [])) == 2
-    check("alternate version: recorded as a second media source", wait_for("alternate version visible", up_versions))
+        return len(up), sorted(m["Path"] for u in up for m in u.get("MediaSources", []))
+    up1080, up720, up2160 = (UP + "/Up (2009) {tmdb-14160} - %s.mkv" % r for r in ("1080p", "720p", "2160p"))
+    make_video(up720)
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": UP}, "movieFile": {"path": up720}})
+    check("alternate version: recorded on the existing movie", wait_for("alternate version visible", lambda: up_sources() == (1, sorted([up1080, up720]))))
+    # A higher one would take over as primary; that hand-over is left to the scheduled scan.
+    make_video(up2160)
+    steps = webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": UP}, "movieFile": {"path": up2160}})["Steps"]
+    check("new primary version: step is skipped for the scheduled scan", [s["Outcome"] for s in steps] == ["skipped"] and "primary version" in (steps[0]["Detail"] or ""))
+    time.sleep(3)
+    check("new primary version: no duplicate movie was created", up_sources()[0] == 1)
+
+    # Two unrelated paths in one request (one movie deleted, another added) never trade history.
+    clue_id = next(i["Id"] for i in items("Movie") if i["Path"].startswith(CLUE))
+    api("POST", "/UserPlayedItems/%s?userId=%s" % (clue_id, user_id), expect=200)
+    ex('rm -r "%s"' % CLUE)
+    tron = MOVIES + "/Tron (1982)/Tron (1982).mkv"
+    make_video(tron)
+    api("POST", "/ArrRefresh/Paths", {"Paths": [CLUE + "/Clue (1985).mkv", tron]}, expect=200)
+    check("unrelated paths: deleted removed, new added", wait_for("unrelated visible", lambda: tron in paths_of("Movie") and not any(p.startswith(CLUE) for p in paths_of("Movie"))))
+    check("unrelated paths: the new movie did not inherit the deleted one's watch state", not next(i for i in items("Movie") if i["Path"] == tron)["UserData"]["Played"])
 
     # A rename where neither name carries an id: no shared key, so watch state is copied over.
     b_old, b_new = BRAZIL + "/Brazil (1985).mkv", BRAZIL + "/Brazil (1985) [Criterion].mkv"

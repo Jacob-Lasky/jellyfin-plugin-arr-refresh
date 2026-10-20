@@ -87,23 +87,23 @@ public class ArrRefreshController : ControllerBase
             return new ArrRefreshResponse(evt.Kind == ArrEventKind.Test ? ResponseStatuses.TestOk : ResponseStatuses.Ignored, evt.Source.ToString(), evt.EventType, null, []);
         }
 
-        return await ApplyAsync(evt.Paths, context, evt.Source.ToString(), evt.EventType, cancellationToken).ConfigureAwait(false);
+        return await ApplyAsync(evt.Paths, evt.Replacements, context, evt.Source.ToString(), evt.EventType, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Applies a list of paths now, through the same code the webhook uses. For scripts, manual
     /// repair, or re-running a webhook that failed.
     /// </summary>
-    /// <param name="request">The paths, as the arr (or Jellyfin, when unmapped) sees them.</param>
+    /// <param name="request">The paths, as the arr (or Jellyfin, when unmapped) sees them, and optionally which old file each new one replaced.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <response code="200">The paths were applied.</response>
     /// <returns>What was done.</returns>
     [HttpPost("Paths")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     public Task<ActionResult<ArrRefreshResponse>> PostPaths([FromBody, Required] PathsRequest request, CancellationToken cancellationToken)
-        => ApplyAsync(request.Paths ?? [], "manual", null, null, cancellationToken);
+        => ApplyAsync((request.Paths ?? []).Concat((request.Replacements ?? []).SelectMany(r => new[] { r.Old, r.New })).Distinct(StringComparer.Ordinal).ToList(), request.Replacements ?? [], "manual", null, null, cancellationToken);
 
-    private async Task<ActionResult<ArrRefreshResponse>> ApplyAsync(IReadOnlyList<string> paths, string context, string? source, string? eventType, CancellationToken cancellationToken)
+    private async Task<ActionResult<ArrRefreshResponse>> ApplyAsync(IReadOnlyList<string> paths, IReadOnlyList<PathReplacement> replacements, string context, string? source, string? eventType, CancellationToken cancellationToken)
     {
         PathMapper mapper;
         try
@@ -116,11 +116,12 @@ public class ArrRefreshController : ControllerBase
             return StatusCode(StatusCodes.Status500InternalServerError, new ArrRefreshResponse(ResponseStatuses.Error, source, eventType, ex.Message, []));
         }
 
-        var mapped = paths
-            .Select(p => PathUtil.Normalize(p) is { } n ? mapper.Map(n) : p)
-            .ToList();
-
-        var results = await _updater.ApplyAsync(mapped, context, cancellationToken).ConfigureAwait(false);
+        string Map(string p) => PathUtil.Normalize(p) is { } n ? mapper.Map(n) : p;
+        var results = await _updater.ApplyAsync(
+            paths.Select(Map).ToList(),
+            replacements.Select(r => new PathReplacement(Map(r.Old), Map(r.New))).ToList(),
+            context,
+            cancellationToken).ConfigureAwait(false);
         var status = results.Any(r => r.Outcome == StepOutcomes.Error) ? ResponseStatuses.Partial : ResponseStatuses.Ok;
         return new ArrRefreshResponse(status, source, eventType, null, results);
     }
@@ -130,7 +131,8 @@ public class ArrRefreshController : ControllerBase
 /// Request body for <c>POST /ArrRefresh/Paths</c>.
 /// </summary>
 /// <param name="Paths">The paths to apply.</param>
-public sealed record PathsRequest(IReadOnlyList<string>? Paths);
+/// <param name="Replacements">Optional: which old file each new file replaced, so the new item inherits watch state, playlists and collections. Their paths are applied too.</param>
+public sealed record PathsRequest(IReadOnlyList<string>? Paths, IReadOnlyList<PathReplacement>? Replacements = null);
 
 /// <summary>
 /// Response body for both endpoints.

@@ -19,26 +19,35 @@ This plugin resolves each path the arr reports on its own and touches nothing el
 
 ## What it does per event
 
-| Arr event | Movies | TV |
-| --- | --- | --- |
-| Import, upgrade | Resolves that one movie folder the way a scan would, creates the new Movie, removes the item for the replaced file | Refreshes the episode's Season (or its Series for a new season) |
-| Rename | Replaces the old item with the new one and carries watch state, playlists and collection membership across | Refreshes the Season; Jellyfin carries watch state |
-| File delete | Removes the item whose file is gone | Refreshes the Season |
-| Movie / series delete | Removes the items under that folder | Removes the Series |
-| New series | | Creates the Series, then refreshes it, which adds its seasons and episodes |
-| Test, Grab, Health, ... | Answers 200, does nothing | Answers 200, does nothing |
+Every path in the payload is reconciled under its **nearest live library folder**: the episode's
+Season, the Series for a new season, or the library root for a movie folder or a new series. Only
+that one entry is resolved, the way a library scan would resolve it, and compared with what the
+database holds for it:
 
-Then it queues a metadata refresh for each new or changed item, at high priority.
+| Arr event | What changes in Jellyfin |
+| --- | --- |
+| Import | The new Movie, Episode, Season or Series is created |
+| Upgrade | The new file's item is created and the replaced file's item removed |
+| Rename (file, or a whole movie or series folder) | The item at the old path is replaced by one at the new path |
+| File delete | The item whose file is gone is removed |
+| Movie / series delete | The items under that folder are removed |
+| An extra version dropped beside a movie | Recorded on the existing movie as another version |
+| Test, Grab, Health, ... | Nothing; answers 200 |
+
+When an item is replaced, its watch state, playlist entries and collection memberships move to
+the new item. For a series or season that moved folders, that includes each of its episodes. Then
+a metadata refresh is queued for each new or changed item, at high priority.
 
 Rules it keeps:
 
 - **Library roots are never refreshed.** A path that is a library root, or that lies outside every
   library, is reported as skipped.
 - **The disk decides, not the payload.** An item is removed only when its own file or folder no
-  longer exists and its library location is reachable. A share that has gone offline changes
-  nothing.
-- **Nothing is written until the whole event is worked out.** Then
-  items are created, pairs are rerouted, and only then are old items removed.
+  longer exists, is checked again immediately before the removal, and the folder it sits in is
+  reachable. A share that has gone offline changes nothing.
+- **Nothing is written until the whole event is worked out**, and once writing starts it finishes,
+  even if the arr hangs up: new items are created, replacements inherit what the old items had, and
+  only then are old items removed.
 - **One event at a time**, so an import and the rename that follows it cannot interleave.
 
 ## Install
@@ -81,9 +90,17 @@ Every step is logged with the prefix `ArrRefresh`.
 
 ## Limits
 
-- An item whose file still exists but no longer resolves the same way (for example, a second file
-  dropped into a movie folder becomes an alternate version) is left for the scheduled library
-  scan, and the step says so.
+- A file that is missing only because its disk dropped out of a union filesystem (Unraid's
+  `/mnt/user`, mergerfs) while the folder above it is still there looks deleted, and an arr event
+  naming it removes its item, as Jellyfin's own scan would. Jellyfin keeps its watch state for
+  90 days and gives it back when the file reappears and the item is re-created.
+- An item whose file still exists but no longer resolves the same way is left for the scheduled
+  library scan, and the step says so.
+- Paths are matched as the library locations spell them: case-insensitively on Windows and macOS,
+  exactly elsewhere. A path that reaches the media through a different mount or a symlink needs a
+  path mapping.
+- When two libraries share one folder, Jellyfin resolves items there with the first library's
+  type and options, during a scan and here alike.
 - Lidarr and Readarr are not handled.
 
 ## Development

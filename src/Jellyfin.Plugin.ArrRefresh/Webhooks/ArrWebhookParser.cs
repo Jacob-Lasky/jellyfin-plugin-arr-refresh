@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json;
 
 namespace Jellyfin.Plugin.ArrRefresh.Webhooks;
@@ -10,8 +11,9 @@ namespace Jellyfin.Plugin.ArrRefresh.Webhooks;
 /// <remarks>
 /// Field names follow Sonarr's and Radarr's <c>Notifications/Webhook/*Payload.cs</c> (Sonarr v4.0.20, Radarr v6.4.4),
 /// which serialise camelCase; matching is case-insensitive so a proxy that re-cases keys still works.
-/// Only paths are extracted. What happened to each path is decided later from the filesystem, so a
-/// payload never has to be trusted about whether a file exists.
+/// Only paths are extracted, plus the old-to-new pairs the arr states outright. What happened to each
+/// path is decided later from the filesystem, so a payload never has to be trusted about whether a
+/// file exists; the pairs only say which new item inherits an old one's history.
 /// </remarks>
 public static class ArrWebhookParser
 {
@@ -51,22 +53,23 @@ public static class ArrWebhookParser
 
             if (eventType.Equals("Test", StringComparison.OrdinalIgnoreCase))
             {
-                return new ArrEvent(source, eventType, instanceName, ArrEventKind.Test, []);
+                return new ArrEvent(source, eventType, instanceName, ArrEventKind.Test, [], []);
             }
 
             var paths = new List<string>();
+            var replacements = new List<PathReplacement>();
             var kind = source switch
             {
-                ArrSource.Radarr => CollectRadarr(root, eventType, paths),
-                ArrSource.Sonarr => CollectSonarr(root, eventType, paths),
+                ArrSource.Radarr => CollectRadarr(root, eventType, paths, replacements),
+                ArrSource.Sonarr => CollectSonarr(root, eventType, paths, replacements),
                 _ => ArrEventKind.Ignored,
             };
 
-            return new ArrEvent(source, eventType, instanceName, kind, Dedupe(paths));
+            return new ArrEvent(source, eventType, instanceName, kind, Dedupe(paths), replacements.Distinct().ToList());
         }
     }
 
-    private static ArrEventKind CollectRadarr(JsonElement root, string eventType, List<string> paths)
+    private static ArrEventKind CollectRadarr(JsonElement root, string eventType, List<string> paths, List<PathReplacement> replacements)
     {
         switch (eventType.ToUpperInvariant())
         {
@@ -74,19 +77,16 @@ public static class ArrWebhookParser
                 // Import and upgrade: the new file, plus the files an upgrade replaced.
                 AddPath(Get(root, "movieFile"), "path", paths);
                 AddEach(Get(root, "deletedFiles"), "path", paths);
+                AddUpgrades(GetPath(Get(root, "movieFile"), "path"), Get(root, "deletedFiles"), replacements);
                 if (paths.Count == 0)
                 {
+                    // Scoped to the one movie folder, so this fallback cannot become a library walk.
                     AddPath(Get(root, "movie"), "folderPath", paths);
                 }
 
                 return ArrEventKind.Apply;
             case "RENAME":
-                foreach (var file in Items(Get(root, "renamedMovieFiles")))
-                {
-                    AddPath(file, "previousPath", paths);
-                    AddPath(file, "path", paths);
-                }
-
+                AddRenames(Get(root, "renamedMovieFiles"), paths, replacements);
                 return ArrEventKind.Apply;
             case "MOVIEFILEDELETE":
                 AddPath(Get(root, "movieFile"), "path", paths);
@@ -100,7 +100,7 @@ public static class ArrWebhookParser
         }
     }
 
-    private static ArrEventKind CollectSonarr(JsonElement root, string eventType, List<string> paths)
+    private static ArrEventKind CollectSonarr(JsonElement root, string eventType, List<string> paths, List<PathReplacement> replacements)
     {
         switch (eventType.ToUpperInvariant())
         {
@@ -110,19 +110,13 @@ public static class ArrWebhookParser
                 AddPath(Get(root, "episodeFile"), "path", paths);
                 AddEach(Get(root, "episodeFiles"), "path", paths);
                 AddEach(Get(root, "deletedFiles"), "path", paths);
-                if (paths.Count == 0)
-                {
-                    AddPath(Get(root, "series"), "path", paths);
-                }
+                AddUpgrades(GetPath(Get(root, "episodeFile"), "path"), Get(root, "deletedFiles"), replacements);
 
-                return ArrEventKind.Apply;
+                // DO NOT fall back to the series path when no file is named: that would refresh the
+                // whole series. An import with no file changes nothing worth guessing at.
+                return paths.Count == 0 ? ArrEventKind.Ignored : ArrEventKind.Apply;
             case "RENAME":
-                foreach (var file in Items(Get(root, "renamedEpisodeFiles")))
-                {
-                    AddPath(file, "previousPath", paths);
-                    AddPath(file, "path", paths);
-                }
-
+                AddRenames(Get(root, "renamedEpisodeFiles"), paths, replacements);
                 return ArrEventKind.Apply;
             case "EPISODEFILEDELETE":
                 AddPath(Get(root, "episodeFile"), "path", paths);
@@ -171,11 +165,45 @@ public static class ArrWebhookParser
         }
     }
 
+    private static string? GetPath(JsonElement? obj, string name)
+        => obj is { } o && GetString(o, name) is { } path && !string.IsNullOrWhiteSpace(path) ? path : null;
+
     private static void AddPath(JsonElement? obj, string name, List<string> paths)
     {
-        if (obj is { } o && GetString(o, name) is { } path && !string.IsNullOrWhiteSpace(path))
+        if (GetPath(obj, name) is { } path)
         {
             paths.Add(path);
+        }
+    }
+
+    private static void AddRenames(JsonElement? files, List<string> paths, List<PathReplacement> replacements)
+    {
+        foreach (var file in Items(files))
+        {
+            var previous = GetPath(file, "previousPath");
+            var current = GetPath(file, "path");
+            AddPath(file, "previousPath", paths);
+            AddPath(file, "path", paths);
+            if (previous is not null && current is not null)
+            {
+                replacements.Add(new PathReplacement(previous, current));
+            }
+        }
+    }
+
+    private static void AddUpgrades(string? imported, JsonElement? deletedFiles, List<PathReplacement> replacements)
+    {
+        if (imported is null)
+        {
+            return;
+        }
+
+        foreach (var file in Items(deletedFiles))
+        {
+            if (GetPath(file, "path") is { } replaced)
+            {
+                replacements.Add(new PathReplacement(replaced, imported));
+            }
         }
     }
 
