@@ -532,7 +532,10 @@ def run():
         q = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path"
         return any(i["Path"] == seven and i.get("RunTimeTicks") for i in api("GET", q, expect=200)[1]["Items"])
     wait_for("se7en refreshed during the outage", refreshed, timeout=120)
-    time.sleep(15)
+    # Longer than the plugin's 30 s request timeout: a stopped container's address sends no reset, so a
+    # write in flight keeps retransmitting and would simply succeed when Meilisearch returns. Only once it
+    # has timed out does delivery depend on the retry.
+    time.sleep(45)
     sh("docker", "start", NAME + "-meili")
     wait_for("Meilisearch back", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
     seven_id = next(i["Id"] for i in items("Movie") if i["Path"] == seven)
