@@ -227,6 +227,7 @@ def _public_ok():
 
 
 def run():
+    global MEILI_INDEX
     status, _ = api("POST", "/ArrRefresh/Webhook", {"eventType": "Test", "movie": {}}, auth=False)
     check("webhook without credentials is refused (401)", status == 401)
     check("Test event answers test-ok", webhook({"eventType": "Test", "movie": {"folderPath": "C:\\testpath"}})["Status"] == "test-ok")
@@ -449,8 +450,12 @@ def run():
     # documents, so it is found only once its own document is in the index, which is what Tower users see.
     # Precondition, or the witness proves nothing: Meilisearch must already have a hit for "Heat Wave"
     # (the moved Heat), so the database fallback stays out of it.
-    check("witness precondition: Meilisearch has a hit for the control title",
-          wait_for("heat hit", lambda: (meili_api("POST", "/indexes/%s/search" % MEILI_INDEX, {"q": "Heat Wave"})[1] or {}).get("hits"), timeout=60))
+    # The moved Heat's OWN document, not just any hit: the old Heat's document still answers for a few
+    # seconds after its item is gone, and a write still in its batch window is dropped when the sync is
+    # switched off below.
+    heat_now = next(i["Id"] for i in items("Movie") if i["Path"] == moved_file)
+    check("witness precondition: the moved Heat is in the index, so the control title has Meilisearch hits",
+          wait_for("moved heat document", lambda: meili_doc(heat_now), timeout=60) is not None)
     api("POST", "/Plugins/%s/Configuration" % PLUGIN_ID, {"PathMappings": "", "UpdateSearchIndex": False}, expect=204)
     wave = MOVIES + "/Heat Wave (2007)/Heat Wave (2007).mkv"
     make_video(wave)
@@ -464,7 +469,9 @@ def run():
         print("    jellyfin search:", found)
     api("POST", "/Plugins/%s/Configuration" % PLUGIN_ID, {"PathMappings": "", "UpdateSearchIndex": True}, expect=204)
     api("POST", "/ArrRefresh/Paths", {"Paths": [wave]}, expect=200)
-    check("search update on: the same title is now found", wait_for("heat wave searchable", lambda: wave in search("Heat Wave"), timeout=60))
+    wave_id = next(i["Id"] for i in items("Movie") if i["Path"] == wave)
+    check("search update on: its document is written", wait_for("heat wave document", lambda: meili_doc(wave_id), timeout=60) is not None)
+    check("search update on: the same title is now found", wave in search("Heat Wave"))
 
     # Path mapping: the arr sees /arr/media, Jellyfin sees /data/media.
     api("POST", "/Plugins/%s/Configuration" % PLUGIN_ID, {"PathMappings": "/arr/media => /data/media"}, expect=204)
@@ -486,10 +493,43 @@ def run():
     check("offline share: nothing was removed", term in paths_of("Movie"))
     ex('mv "%s-offline" "%s"' % (SHARE, SHARE))
 
+    # A rebuild that read the database before a write and swapped after it discards the write. Simulate
+    # the discarded document by deleting it in Meilisearch: the verification pass must write it again.
+    guid = meili_doc(wave_id)["guid"]
+    meili_api("DELETE", "/indexes/%s/documents/%s" % (MEILI_INDEX, guid))
+    wait_for("document deleted", lambda: meili_doc(wave_id) is None, timeout=30)
+    check("document lost to a rebuild is written again by the verification pass", wait_for("document restored", lambda: meili_doc(wave_id), timeout=240) is not None)
+
+    # Meilisearch down (game mode stops it): the write waits and goes through once it is back.
+    sh("docker", "stop", "-t", "10", NAME + "-meili")
+    seven = MOVIES + "/Se7en (1995)/Se7en (1995).mkv"
+    make_video(seven)
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": seven.rsplit("/", 1)[0]}, "movieFile": {"path": seven}})
+    wait_for("se7en visible", lambda: seven in paths_of("Movie"))
+    time.sleep(10)
+    sh("docker", "start", NAME + "-meili")
+    wait_for("Meilisearch back", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
+    seven_id = next(i["Id"] for i in items("Movie") if i["Path"] == seven)
+    check("Meilisearch outage: the write is retried and lands once it is back", wait_for("se7en document", lambda: meili_doc(seven_id), timeout=180) is not None)
+
     steps = api("POST", "/ArrRefresh/Paths", {"Paths": [MOVIES, TV + "/", "/etc/passwd"]}, expect=200)[1]["Steps"]
     check("library roots and outside paths are skipped", [s["Action"] for s in steps] == ["Skip", "Skip", "Skip"])
     time.sleep(3)
     check("no library root was validated by any of the above", len(root_validations()) == baseline)
+
+    # With no index name set, the Meilisearch plugin names its index after the server (spaces to dashes);
+    # the writes must follow it there. Last, because it switches the index everything above used.
+    server = api("GET", "/System/Info/Public", auth=False, expect=200)[1]["ServerName"].replace(" ", "-")
+    api("POST", "/Plugins/%s/Configuration" % MEILI_PLUGIN_ID, {"ApiKey": MEILI_KEY, "Url": meili, "Debug": False, "IndexName": "", "MatchingStrategy": "last"}, expect=204)
+    wait_for("reconnected", lambda: api("GET", "/meilisearch/reconnect", expect=200)[1]["meilisearchOk"], timeout=60)
+    api("GET", "/meilisearch/reindex", expect=200)
+    MEILI_INDEX = server
+    fargo = MOVIES + "/Fargo (1996)/Fargo (1996).mkv"
+    make_video(fargo)
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": fargo.rsplit("/", 1)[0]}, "movieFile": {"path": fargo}})
+    wait_for("fargo visible", lambda: fargo in paths_of("Movie"))
+    fargo_id = next(i["Id"] for i in items("Movie") if i["Path"] == fargo)
+    check("default index name: the document goes to the index named after the server", wait_for("fargo document", lambda: meili_doc(fargo_id), timeout=60) is not None)
 
 
 def main():
