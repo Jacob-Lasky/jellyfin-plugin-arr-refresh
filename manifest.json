@@ -1,0 +1,20 @@
+[
+  {
+    "guid": "89c19d1d-6a41-4cc3-aad3-d72b1d32039f",
+    "versions": [
+      {
+        "version": "1.0.0.0",
+        "changelog": "First release.\n\n- Sonarr and Radarr Webhook connections post to /ArrRefresh/Webhook.\n- Imports, upgrades, renames and deletes update only the affected movie, series, season or episode. A library root is never refreshed.\n- Replaced items hand their watch state, playlist entries and collection memberships to their successors, including every episode of a series that moved folders.\n- Nothing is removed while its file exists or its share is offline.\n- POST /ArrRefresh/Paths runs the same work on demand.",
+        "targetAbi": "12.2.0.0",
+        "sourceUrl": "https://github.com/Jacob-Lasky/jellyfin-plugin-arr-refresh/releases/download/v1.0.0.0/arr-refresh_1.0.0.0.zip",
+        "checksum": "3ecdbb53dcc45f11e9e3281d43f7b43d",
+        "timestamp": "2026-10-20T16:15:39Z"
+      }
+    ],
+    "name": "Arr Refresh",
+    "overview": "Sonarr/Radarr webhooks update only the movie or episode that changed, never the whole library.",
+    "description": "Point Sonarr's and Radarr's stock Webhook connection at /ArrRefresh/Webhook. On import, upgrade, rename and delete, the plugin resolves only the affected path: it creates or replaces the movie (or the series) under its existing parent, removes items whose files are gone, carries watch state and collection membership across a rename, and queues a metadata refresh for that item alone. Episodes refresh only their Season. Nothing ever re-validates a library root, so large libraries on slow or union filesystems are not walked on every change.",
+    "owner": "Jacob-Lasky",
+    "category": "General"
+  }
+]
