@@ -131,6 +131,8 @@ Every step is logged with the prefix `ArrRefresh`.
   path mapping.
 - When two libraries share one folder, Jellyfin resolves items there with the first library's
   type and options, during a scan and here alike.
+- A library that was empty at its last scan has no root item yet, so the first import into it is
+  reported as an error ("run a library scan once") and nothing changes; scan it once.
 - Lidarr and Readarr are not handled.
 
 ## Development

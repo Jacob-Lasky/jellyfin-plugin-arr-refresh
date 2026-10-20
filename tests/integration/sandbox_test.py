@@ -189,7 +189,8 @@ def setup(dll):
               BRAZIL + "/Brazil (1985).mkv",
               CLUE + "/Clue (1985).mkv",
               ALIENS + "/Aliens (1986) {tmdb-679} [Bluray-1080p].mkv",
-              ALIENS + "/leftover.mkv"]:
+              ALIENS + "/leftover.mkv",
+              LOCAL + "/Placeholder (2000)/Placeholder (2000).mkv"]:  # an empty library gets no root item
         make_video(p)
     sh("docker", "restart", "-t", "30", NAME)  # load the plugin copied in after the first start
     ip = sh("docker", "inspect", NAME, "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}")
@@ -215,8 +216,8 @@ def setup(dll):
                             "TypeOptions": [{"Type": "Movie", "MetadataFetchers": [], "MetadataFetcherOrder": [], "ImageFetchers": [], "ImageFetcherOrder": []}]}},
         expect=204)
     api("POST", "/Library/Refresh", expect=204)
-    wait_for("initial scan finds 8 movies and 2 episodes",
-             lambda: len(items("Movie")) == 8 and len(items("Episode")) == 2, timeout=180)
+    wait_for("initial scan finds 9 movies and 2 episodes",
+             lambda: len(items("Movie")) == 9 and len(items("Episode")) == 2, timeout=180)
     # Their full reindex once, as Tower's runs nightly, so the index exists with documents in their shape.
     api("GET", "/meilisearch/reindex", expect=200)
     wait_for("Meilisearch index built", lambda: (meili_api("GET", "/indexes/%s/stats" % MEILI_INDEX)[1] or {}).get("numberOfDocuments", 0) > 0, timeout=60)
