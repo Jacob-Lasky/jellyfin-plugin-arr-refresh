@@ -455,21 +455,33 @@ def run():
     check("keyless rename: new path only", wait_for("keyless rename visible", lambda: b_new in paths_of("Movie") and b_old not in paths_of("Movie")))
     check("keyless rename: watch state copied", next(i for i in items("Movie") if i["Path"] == b_new)["UserData"]["Played"])
 
-    # Two copies merged as versions of one movie (Merge Versions, or Jellyfin's own merge): one copy's
-    # file is deleted. FindByPath hides a merged version, so it must be found by its path anyway.
+    # Copies merged as versions of one movie (Merge Versions, or Jellyfin's own merge). FindByPath and the
+    # children listing both hide a merged version, so each way of finding one gets its own witness.
     vA, vB = MOVIES + "/Twin (2010)/Twin (2010).mkv", MOVIES + "/Twin (2010) {imdbid-/Twin (2010).mkv"
     for v in (vA, vB):
         make_video(v)
         webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": v.rsplit("/", 1)[0]}, "movieFile": {"path": v}})
     wait_for("twins visible", lambda: {vA, vB} <= paths_of("Movie"))
-    ids = {i["Path"]: i["Id"] for i in items("Movie")}
-    api("POST", "/Videos/MergeVersions?ids=%s,%s" % (ids[vA], ids[vB]), expect=204)
-    ex('rm -r "%s"' % vB.rsplit("/", 1)[0])
-    webhook({"eventType": "MovieFileDelete", "instanceName": "Radarr", "movie": {"folderPath": vB.rsplit("/", 1)[0]}, "movieFile": {"path": vB}})
-    def twin_rows():
+    def merge(a, b):
+        ids = {i["Path"]: i["Id"] for i in items("Movie")}
+        api("POST", "/Videos/MergeVersions?ids=%s,%s" % (ids[a], ids[b]), expect=204)
+    def twin_sources():
         q = "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources"
-        return sorted(m["Path"] for i in api("GET", q, expect=200)[1]["Items"] if i["Path"] in (vA, vB) for m in i.get("MediaSources", []))
-    check("merged version deleted: only the surviving copy is left", wait_for("merged version gone", lambda: twin_rows() == [vA], timeout=60))
+        return sorted(m["Path"] for i in api("GET", q, expect=200)[1]["Items"] if i["Path"].startswith(MOVIES + "/Twin (2010)") for m in i.get("MediaSources", []))
+    merge(vA, vB)
+    # 1. Renamed inside a folder that still exists: only a by-path lookup that includes versions finds
+    #    the old item (the folder resolves, so the children listing is not consulted).
+    vB2 = vB.replace(".mkv", " [Bluray-1080p].mkv")
+    ex('mv "%s" "%s"' % (vB, vB2))
+    webhook({"eventType": "Rename", "instanceName": "Radarr", "movie": {"folderPath": vB.rsplit("/", 1)[0]},
+             "renamedMovieFiles": [{"path": vB2, "previousPath": vB}]})
+    check("merged version renamed: the old item is gone", wait_for("merged rename", lambda: vB not in twin_sources() and vB2 in twin_sources(), timeout=60))
+    # 2. Deleted with its folder, the payload naming only the folder: only a children listing that
+    #    includes versions finds it.
+    merge(vA, vB2)
+    ex('rm -r "%s"' % vB.rsplit("/", 1)[0])
+    webhook({"eventType": "MovieDelete", "instanceName": "Radarr", "movie": {"folderPath": vB.rsplit("/", 1)[0]}, "deletedFiles": True})
+    check("merged version deleted with its folder: only the surviving copy is left", wait_for("merged version gone", lambda: twin_sources() == [vA], timeout=60))
 
     # A stray copy imported from inside the library (manual import with Move): the arr names the old
     # file as the import's sourcePath, and the imported item inherits its watch state.
