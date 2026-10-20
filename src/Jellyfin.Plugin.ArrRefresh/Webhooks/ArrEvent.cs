@@ -54,4 +54,7 @@ public sealed record ArrEvent(
 /// </summary>
 /// <param name="Old">The path that went away.</param>
 /// <param name="New">The path that replaced it.</param>
-public sealed record PathReplacement(string Old, string New);
+/// <param name="SameTitleOnly">True when the arr did not track the old file as this title (an import's
+/// source path): the items pair only if they share an id key, so a file taken from another movie's folder
+/// cannot hand that movie's history over.</param>
+public sealed record PathReplacement(string Old, string New, bool SameTitleOnly = false);

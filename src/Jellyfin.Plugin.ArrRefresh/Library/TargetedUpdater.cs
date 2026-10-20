@@ -86,9 +86,9 @@ public sealed class TargetedUpdater : IDisposable
     public async Task<IReadOnlyList<StepResult>> ApplyAsync(IReadOnlyList<string> paths, IReadOnlyList<PathReplacement> replacements, string context, CancellationToken cancellationToken)
     {
         var normalizedReplacements = replacements
-            .Select(r => (Old: PathUtil.Normalize(r.Old), New: PathUtil.Normalize(r.New)))
+            .Select(r => (Old: PathUtil.Normalize(r.Old), New: PathUtil.Normalize(r.New), Original: r))
             .Where(r => r.Old is not null && r.New is not null)
-            .Select(r => new PathReplacement(r.Old!, r.New!))
+            .Select(r => r.Original with { Old = r.Old!, New = r.New! })
             .ToList();
 
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -196,7 +196,7 @@ public sealed class TargetedUpdater : IDisposable
                 .ToList();
 
             var byArr = sameType
-                .Where(c => replacements.Any(r => Covers(old.Path, r.Old) && Covers(c.Path, r.New)))
+                .Where(c => replacements.Any(r => Covers(old.Path, r.Old) && Covers(c.Path, r.New) && (!r.SameTitleOnly || SharesKey(c))))
                 .ToList();
             var matches = byArr.Count > 0 ? byArr : sameType.Where(SharesKey).ToList();
             if (matches.Count == 1)

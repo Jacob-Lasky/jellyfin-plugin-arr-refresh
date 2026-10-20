@@ -119,7 +119,7 @@ public class ArrRefreshController : ControllerBase
         string Map(string p) => PathUtil.Normalize(p) is { } n ? mapper.Map(n) : p;
         var results = await _updater.ApplyAsync(
             paths.Select(Map).ToList(),
-            replacements.Select(r => new PathReplacement(Map(r.Old), Map(r.New))).ToList(),
+            replacements.Select(r => r with { Old = Map(r.Old), New = Map(r.New) }).ToList(),
             context,
             cancellationToken).ConfigureAwait(false);
         var status = results.Any(r => r.Outcome == StepOutcomes.Error) ? ResponseStatuses.Partial : ResponseStatuses.Ok;

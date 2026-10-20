@@ -209,7 +209,7 @@ public static class ArrWebhookParser
         }
 
         paths.Add(source);
-        replacements.Add(new PathReplacement(source, imported));
+        replacements.Add(new PathReplacement(source, imported, SameTitleOnly: true));
     }
 
     private static void AddUpgrades(string? imported, JsonElement? deletedFiles, List<PathReplacement> replacements)

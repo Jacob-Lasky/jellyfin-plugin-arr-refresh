@@ -502,18 +502,32 @@ def run():
     check("merged version deleted with its folder: only the surviving copy is left", wait_for("merged version gone", lambda: twin_sources() == [primary], timeout=60))
 
     # A stray copy imported from inside the library (manual import with Move): the arr names the old
-    # file as the import's sourcePath, and the imported item inherits its watch state.
-    stray = MOVIES + "/Stray (2003) {imdbid-/Stray (2003).mkv"
+    # file as the import's sourcePath. Same title (shared tmdb id in the names, as Radarr writes them):
+    # the imported item inherits the stray one's watch state.
+    stray = MOVIES + "/Stray (2003) {imdbid-/Stray (2003) {tmdb-123401}.mkv"
     make_video(stray)
     webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": stray.rsplit("/", 1)[0]}, "movieFile": {"path": stray}})
     wait_for("stray visible", lambda: stray in paths_of("Movie"))
     api("POST", "/UserPlayedItems/%s?userId=%s" % (next(i["Id"] for i in items("Movie") if i["Path"] == stray), user_id), expect=200)
-    placed = MOVIES + "/Stray (2003)/Stray (2003) [Bluray-1080p].mkv"
+    placed = MOVIES + "/Stray (2003) {tmdb-123401}/Stray (2003) {tmdb-123401} [Bluray-1080p].mkv"
     ex('mkdir -p "%s" && mv "%s" "%s" && rmdir "%s"' % (placed.rsplit("/", 1)[0], stray, placed, stray.rsplit("/", 1)[0]))
     webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": placed.rsplit("/", 1)[0]},
              "movieFile": {"path": placed, "sourcePath": stray}})
     check("in-library import: moved item replaces the stray one", wait_for("stray moved", lambda: placed in paths_of("Movie") and stray not in paths_of("Movie")))
     check("in-library import: watch state carried over", next(i for i in items("Movie") if i["Path"] == placed)["UserData"]["Played"])
+    # A different title's file imported (another movie's copy taken by a manual import): its item goes,
+    # but its history does not move to the movie it was imported as.
+    other = MOVIES + "/Other (1999) {imdbid-/Other (1999) {tmdb-123402}.mkv"
+    make_video(other)
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": other.rsplit("/", 1)[0]}, "movieFile": {"path": other}})
+    wait_for("other visible", lambda: other in paths_of("Movie"))
+    api("POST", "/UserPlayedItems/%s?userId=%s" % (next(i["Id"] for i in items("Movie") if i["Path"] == other), user_id), expect=200)
+    taken = MOVIES + "/Taken (2008) {tmdb-123403}/Taken (2008) {tmdb-123403} [Bluray-1080p].mkv"
+    ex('mkdir -p "%s" && mv "%s" "%s" && rmdir "%s"' % (taken.rsplit("/", 1)[0], other, taken, other.rsplit("/", 1)[0]))
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": taken.rsplit("/", 1)[0]},
+             "movieFile": {"path": taken, "sourcePath": other}})
+    check("import of another title's file: the old item goes", wait_for("other gone", lambda: taken in paths_of("Movie") and other not in paths_of("Movie")))
+    check("import of another title's file: its watch state does not move", not next(i for i in items("Movie") if i["Path"] == taken)["UserData"]["Played"])
 
     # A movie moved to a new folder, through the on-demand endpoint: two steps, still paired.
     moved = MOVIES + "/Heat (1995) {tmdb-949} {edition-Directors Cut}"
