@@ -13,14 +13,16 @@ Assertions are on item types, paths, watch state and collection membership, neve
 because names come from TMDb/TVDb and the sandbox may or may not have network access.
 """
 import json
+import os
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 IMAGE = "jellyfin/jellyfin:12.2.20261005-225228"  # the 12.2.0 release build; matches targetAbi
-NAME = "arr-refresh-it-%d" % int(time.time())
+NAME = "arr-refresh-it-%d-%s" % (os.getpid(), uuid.uuid4().hex[:8])  # unique even for runs started in the same second
 MOVIES, TV = "/data/media/movies", "/data/media/tv"
 HEAT = MOVIES + "/Heat (1995) {tmdb-949}"
 ALIEN = MOVIES + "/Alien (1979) {tmdb-348}"

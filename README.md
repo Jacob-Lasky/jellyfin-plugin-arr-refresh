@@ -32,10 +32,15 @@ database holds for it:
 | File delete | The item whose file is gone is removed |
 | Movie / series delete | The items under that folder are removed |
 | An extra version dropped beside a movie | Recorded on the existing movie as another version |
+| A version that outranks the current primary (2160p beside 1080p) | Left for the scheduled scan, which promotes versions; files that are gone are still removed |
 | Test, Grab, Health, ... | Nothing; answers 200 |
 
 When an item is replaced, its watch state, playlist entries and collection memberships move to
-the new item. For a series or season that moved folders, that includes each of its episodes. Then
+the new item. For a series or season that moved folders, that includes each of its episodes.
+Which new item replaces which old one comes from the arr itself (a rename's previous and new path,
+an upgrade's replaced and imported file), then from a shared id in the path. An ambiguous match,
+such as one multi-episode file replacing two episodes, carries nothing, and Jellyfin's own
+id-based matching decides. Then
 a metadata refresh is queued for each new or changed item, at high priority.
 
 Rules it keeps:
@@ -95,7 +100,8 @@ Every step is logged with the prefix `ArrRefresh`.
   naming it removes its item, as Jellyfin's own scan would. Jellyfin keeps its watch state for
   90 days and gives it back when the file reappears and the item is re-created.
 - An item whose file still exists but no longer resolves the same way is left for the scheduled
-  library scan, and the step says so.
+  library scan, and the step says so. So is a new file that would take over as a movie's primary
+  version.
 - Paths are matched as the library locations spell them: case-insensitively on Windows and macOS,
   exactly elsewhere. A path that reaches the media through a different mount or a symlink needs a
   path mapping.
