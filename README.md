@@ -146,7 +146,8 @@ python3 tests/integration/sandbox_test.py \
 
 The integration test starts a throwaway Jellyfin 12.2 container, plays every webhook above
 against generated media, and checks the library after each one, including that no library root
-was validated. CI runs both.
+was validated. CI runs both. Its containers and network are removed however the run ends, SIGKILL included (a
+reaper process watches the test), and a later run sweeps any run whose reaper also died. To list leftovers: `docker ps -a --filter label=arr-refresh-it.owner`.
 
 To release, bump `<Version>` in `Directory.Build.props`, commit to `main`, and push an annotated
 tag `v<Version>`. Its message becomes the changelog. The Release workflow builds, tests, attaches
