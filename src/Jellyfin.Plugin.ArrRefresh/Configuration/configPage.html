@@ -16,7 +16,7 @@
                             <li><b>URL</b>: <code><span class="arrRefreshUrl"></span>/ArrRefresh/Webhook</code></li>
                             <li><b>Method</b>: POST</li>
                             <li><b>Headers</b>: key <code>Authorization</code>, value <code>MediaBrowser Token="&lt;API key&gt;"</code>, using a key from Dashboard &gt; API Keys</li>
-                            <li><b>Triggers</b>: On File Import, On File Upgrade, On Rename, On Movie/Series Delete, On Movie/Episode File Delete</li>
+                            <li><b>Triggers</b>: On File Import, On File Upgrade, On Rename, On Movie/Series Delete, On Movie/Episode File Delete. Leave the "File Delete For Upgrade" triggers off: they fire before the new file is in place.</li>
                         </ul>
                         <p>Then turn off "Update library" on any Emby/Jellyfin connection in the same app, so changes are not sent twice.</p>
                     </div>

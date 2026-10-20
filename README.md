@@ -67,6 +67,10 @@ Rules it keeps:
    - Headers: `Authorization` = `MediaBrowser Token="<API key>"`
    - Triggers: On File Import, On File Upgrade, On Rename, On Movie/Series Delete, On
      Movie/Episode File Delete. The others are accepted and ignored.
+   - Leave **On Movie File Delete For Upgrade** and **On Episode File Delete For Upgrade** off.
+     They fire before the new file is in place, so the item would be removed by one event and
+     re-created by the next, losing its playlist and collection entries. The upgrade's own import
+     event already names the files it replaced.
 4. Turn off **Update Library** on any existing Emby/Jellyfin connection in the same arr, so each
    change is not sent twice.
 
@@ -107,6 +111,9 @@ Every step is logged with the prefix `ArrRefresh`.
   path mapping.
 - When two libraries share one folder, Jellyfin resolves items there with the first library's
   type and options, during a scan and here alike.
+- With the Meilisearch search plugin, a new item can be browsed and played at once but is found by
+  search only after that plugin's next reindex, which it runs after a full library scan and on its
+  own schedule.
 - Lidarr and Readarr are not handled.
 
 ## Development
