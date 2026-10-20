@@ -3,6 +3,14 @@
     "guid": "89c19d1d-6a41-4cc3-aad3-d72b1d32039f",
     "versions": [
       {
+        "version": "1.2.0.0",
+        "changelog": "Merged versions and in-library imports.\n\n- An item merged as a version of another (Merge Versions, or Jellyfin's own merge) is found by its path and removed when its file goes; before, it stayed until the next library scan.\n- An import that moves a file from inside the library (a manual import of a stray copy) removes the old item, and hands its watch state and links to the imported one when both are the same title.\n- Skipped paths (every import's download folder) log at Debug.",
+        "targetAbi": "12.2.0.0",
+        "sourceUrl": "https://github.com/Jacob-Lasky/jellyfin-plugin-arr-refresh/releases/download/v1.2.0.0/arr-refresh_1.2.0.0.zip",
+        "checksum": "6e1eeeeb7b2e10c5ce5567eb0bcaa8bc",
+        "timestamp": "2026-10-20T21:29:33Z"
+      },
+      {
         "version": "1.1.0.0",
         "changelog": "Search stays current.\n\n- Items this plugin adds or changes (and the seasons and episodes of a new series) are written to the Meilisearch plugin's search index within seconds, with that plugin's own connection settings and document shape. Nothing else is indexed and no full reindex is run.\n- Each written document is checked again after 45 seconds, 3 and 15 minutes, so one a concurrent rebuild swapped away is written again, and one left for a removed item is deleted.\n- Writes retry with backoff for an hour while Meilisearch is down.\n- Off switch on the settings page.",
         "targetAbi": "12.2.0.0",
