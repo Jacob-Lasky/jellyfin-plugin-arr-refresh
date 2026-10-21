@@ -3,6 +3,9 @@
 A Jellyfin server plugin that takes Sonarr's and Radarr's stock **Webhook** connection and updates
 only the movie or episode that changed. It never refreshes a whole library.
 
+This plugin was developed primarily with an AI coding agent (Claude Code). CI tests every change
+against a real Jellyfin 12.2 server.
+
 ## Why
 
 Sonarr's and Radarr's built-in Emby/Jellyfin connection calls `POST /Library/Media/Updated` with a
@@ -28,7 +31,8 @@ database holds for it:
 | --- | --- |
 | Import | The new Movie, Episode, Season or Series is created |
 | Upgrade | The new file's item is created and the replaced file's item removed |
-| Rename (file, or a whole movie or series folder) | The item at the old path is replaced by one at the new path |
+| Rename (files) | The item at the old path is replaced by one at the new path |
+| Folder moved in the arr | Nothing: the arrs send no event for a move; reconcile it with `POST /ArrRefresh/Paths` (see [Limits](#limits)) |
 | File delete | The item whose file is gone is removed |
 | Movie / series delete | The items under that folder are removed |
 | An extra version dropped beside a movie | Recorded on the existing movie as another version |
@@ -36,7 +40,8 @@ database holds for it:
 | Test, Grab, Health, ... | Nothing; answers 200 |
 
 When an item is replaced, its watch state, playlist entries and collection memberships move to
-the new item. For a series or season that moved folders, that includes each of its episodes.
+the new item. For a series or season that moved folders (reported through `/ArrRefresh/Paths`,
+since the arrs send no event for a move), that includes each of its episodes.
 Which new item replaces which old one comes from the arr itself (a rename's previous and new path,
 an upgrade's replaced and imported file), then from a shared id in the path. An ambiguous match,
 such as one multi-episode file replacing two episodes, carries nothing, and Jellyfin's own
