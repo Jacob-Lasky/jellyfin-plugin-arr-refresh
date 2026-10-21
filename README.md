@@ -138,6 +138,14 @@ Every step is logged with the prefix `ArrRefresh`.
   type and options, during a scan and here alike.
 - A library that was empty at its last scan has no root item yet, so the first import into it is
   reported as an error ("run a library scan once") and nothing changes; scan it once.
+- **Moving a movie or series folder in the arr sends no event.** Radarr's and Sonarr's Connect
+  notifications have no handler for a folder move (`MovieMovedEvent`, `SeriesMovedEvent`; checked
+  in Radarr 6.4.4 and Sonarr 4.0.20), so a move made from the arr (a changed root folder or path,
+  or the mass editor rebuilding a folder name) reaches neither this plugin nor any other Connect
+  target. Tell the plugin yourself afterwards, with the old and new file and the pair, so the item
+  keeps its watch state:
+  `POST /ArrRefresh/Paths` `{"Paths": [old, new], "Replacements": [{"Old": old, "New": new}]}`.
+  For a series, pass every moved episode file the same way (old and new path, and the pair).
 - Lidarr and Readarr are not handled.
 
 ## Development
