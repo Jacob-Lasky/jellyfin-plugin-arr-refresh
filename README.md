@@ -39,8 +39,15 @@ database holds for it:
 | A version that outranks the current primary (2160p beside 1080p) | Left for the scheduled scan, which promotes versions; files that are gone are still removed |
 | Test, Grab, Health, ... | Nothing; answers 200 |
 
-When an item is replaced, its watch state, playlist entries and collection memberships move to
-the new item. For a series or season that moved folders (reported through `/ArrRefresh/Paths`,
+When an item is replaced, its watch state, playlist entries, collection memberships and images move to
+the new item. Images include anything set on purpose, such as a TitleCardMaker title card: a rename's
+Sonarr payload names no episode, so TitleCardMaker never uploads the card again, and a fresh fetch would
+bring the provider's still instead (Jacob-Lasky/homelab#200). The old item's images replace whatever the
+new item picked up in its first seconds; an image file that is already gone (a sidecar the arr moved to
+the new name) is skipped, and the new item finds it at its new name. An image that cannot be read or saved is logged and
+skipped; the rest of the change goes ahead. With "save artwork into media folders" on, Jellyfin writes a
+carried image beside the media under the new name, as it does any image; leaving that off keeps the arr
+the only writer of sidecars (on Tower it is off). For a series or season that moved folders (reported through `/ArrRefresh/Paths`,
 since the arrs send no event for a move), that includes each of its episodes.
 Which new item replaces which old one comes from the arr itself (a rename's previous and new path,
 an upgrade's replaced and imported file), then from a shared id in the path. An ambiguous match,

@@ -10,8 +10,8 @@ overview: "Sonarr/Radarr webhooks update only the movie or episode that changed,
 description: >
   Point Sonarr's and Radarr's stock Webhook connection at /ArrRefresh/Webhook. On import, upgrade,
   rename and delete, the plugin resolves only the affected path: it creates or replaces the movie
-  (or the series) under its existing parent, removes items whose files are gone, carries watch state
-  and collection membership across a rename, and queues a metadata refresh for that item alone.
+  (or the series) under its existing parent, removes items whose files are gone, carries watch state,
+  collection membership and images across a rename, and queues a metadata refresh for that item alone.
   Episodes refresh only their Season. Nothing ever re-validates a library root, so large libraries
   on slow or union filesystems are not walked on every change.
 artifacts:
