@@ -550,43 +550,61 @@ public sealed class TargetedUpdater : IDisposable
     /// created; it has nothing anyone chose yet. Read here, before the old item is removed: removing it
     /// deletes the images it kept in Jellyfin's metadata folder. An image file that is gone (a sidecar
     /// beside the media that the arr already moved to the new name) is skipped; the replacement finds
-    /// that one at its new name. DO NOT drop this for "the next refresh fetches images anyway": a fetch
-    /// brings the provider's image, never the one that was set.
+    /// that one at its new name. With a library's "save artwork into media folders" on, Jellyfin writes a
+    /// carried image beside the media under the new name, as it does any image it saves. Each image fails
+    /// on its own: one that cannot be read or saved is logged, and the carry and the removal go on.
+    /// Chapter images are not item images and are not carried (Jellyfin makes them from the video).
+    /// DO NOT drop this for "the next refresh fetches images anyway": a fetch brings the provider's image,
+    /// never the one that was set.
     /// </summary>
     private async Task CopyImagesAsync(BaseItem old, BaseItem replacement, CancellationToken cancellationToken)
     {
         var copied = 0;
         foreach (var group in old.ImageInfos.Where(i => i.IsLocalFile).GroupBy(i => i.Type))
         {
-            var index = 0;
-            foreach (var image in group)
+            // Each image keeps its own position among its type (a missing backdrop never shifts the rest).
+            foreach (var (image, position) in group.Select((image, position) => (image, position)))
             {
                 byte[] bytes;
                 try
                 {
                     bytes = await File.ReadAllBytesAsync(image.Path, cancellationToken).ConfigureAwait(false);
                 }
-                catch (IOException)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    continue;   // gone or unreadable: nothing to carry
-                }
-                catch (UnauthorizedAccessException)
-                {
+                    _logger.LogDebug("ArrRefresh: image {Path} of {Old} not carried: {Message}", image.Path, old.Path, ex.Message);
                     continue;
                 }
 
                 using var stream = new MemoryStream(bytes);
-                int? at = group.Key == ImageType.Backdrop ? index : null;
-                await _providerManager.SaveImage(replacement, stream, MimeTypes.GetMimeType(image.Path), group.Key, at, cancellationToken).ConfigureAwait(false);
-                index++;
-                copied++;
+                int? index = group.Key is ImageType.Backdrop or ImageType.Screenshot ? position : null;
+                try
+                {
+                    await _providerManager.SaveImage(replacement, stream, MimeTypes.GetMimeType(image.Path), group.Key, index, cancellationToken).ConfigureAwait(false);
+                    copied++;
+                }
+#pragma warning disable CA1031 // One image that cannot be saved must not stop the carry and the removal that follow it.
+                catch (Exception ex) when (ex is not OperationCanceledException)
+#pragma warning restore CA1031
+                {
+                    _logger.LogWarning(ex, "ArrRefresh: could not carry the {Type} image of {Old} to {New}", group.Key, old.Path, replacement.Path);
+                }
             }
         }
 
         if (copied > 0)
         {
-            await replacement.UpdateToRepositoryAsync(ItemUpdateType.ImageUpdate, cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("ArrRefresh: carried {Count} image(s) from {Old} to {New}", copied, old.Path, replacement.Path);
+            try
+            {
+                await replacement.UpdateToRepositoryAsync(ItemUpdateType.ImageUpdate, cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("ArrRefresh: carried {Count} image(s) from {Old} to {New}", copied, old.Path, replacement.Path);
+            }
+#pragma warning disable CA1031 // As above: the carry and the removal go on; the new item's own refresh still runs.
+            catch (Exception ex) when (ex is not OperationCanceledException)
+#pragma warning restore CA1031
+            {
+                _logger.LogWarning(ex, "ArrRefresh: could not record the images carried to {New}", replacement.Path);
+            }
         }
     }
 

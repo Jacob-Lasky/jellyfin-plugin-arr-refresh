@@ -717,11 +717,17 @@ def run():
     b_old, b_new = BRAZIL + "/Brazil (1985).mkv", BRAZIL + "/Brazil (1985) [Criterion].mkv"
     b_id = next(i["Id"] for i in items("Movie") if i["Path"] == b_old)
     api("POST", "/UserPlayedItems/%s?userId=%s" % (b_id, user_id), expect=200)
+    # Its image cannot be read: the carry skips it, and the rename still completes (each image fails alone).
+    set_image(b_id, png((10, 160, 10)))
+    stored = next(i["Path"] for i in api("GET", "/Items/%s/Images" % b_id, expect=200)[1] if i["ImageType"] == "Primary")
+    sh("docker", "exec", "-u", "0", NAME, "chmod", "000", stored)
     ex('mv "%s" "%s"' % (b_old, b_new))
     webhook({"eventType": "Rename", "instanceName": "Radarr", "movie": {"folderPath": BRAZIL},
              "renamedMovieFiles": [{"path": b_new, "previousPath": b_old}]})
     check("keyless rename: new path only", wait_for("keyless rename visible", lambda: b_new in paths_of("Movie") and b_old not in paths_of("Movie")))
     check("keyless rename: watch state copied", next(i for i in items("Movie") if i["Path"] == b_new)["UserData"]["Played"])
+    check("an image that cannot be read is skipped, never the rename (the old item is gone, the new one kept its links)",
+          b_id not in {i["Id"] for i in items("Movie")} and image_of(next(i["Id"] for i in items("Movie") if i["Path"] == b_new)) != png((10, 160, 10)))
 
     # Copies merged as versions of one movie (Merge Versions, or Jellyfin's own merge). FindByPath and the
     # children listing both hide a merged version, so each way of finding one gets its own witness.
