@@ -16,6 +16,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.IO;
+using MediaBrowser.Model.Net;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.ArrRefresh.Library;
@@ -526,8 +527,8 @@ public sealed class TargetedUpdater : IDisposable
 
     /// <summary>
     /// Moves what hangs off the old item to its replacement: playlist and collection entries always,
-    /// and watch state when the two share no user-data key (Jellyfin's own reattachment matches by
-    /// key, so without one it would never find them).
+    /// its images, and watch state when the two share no user-data key (Jellyfin's own reattachment
+    /// matches by key, so without one it would never find them).
     /// </summary>
     private async Task CarryAsync(BaseItem old, BaseItem replacement, bool sharesKey, CancellationToken cancellationToken)
     {
@@ -535,6 +536,57 @@ public sealed class TargetedUpdater : IDisposable
         if (!sharesKey)
         {
             CopyUserData(old, replacement, cancellationToken);
+        }
+
+        await CopyImagesAsync(old, replacement, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gives the replacement the old item's images, so artwork set on purpose survives a rename or an
+    /// upgrade: a TitleCardMaker title card (uploaded once, and never uploaded again for a rename, whose
+    /// Sonarr payload names no episode), a chosen poster. Without this the new item starts from a fresh
+    /// fetch: on Tower (homelab#200) every rename swapped an episode's title card for a plain still.
+    /// The old item's images win over what the replacement picked up in the seconds since it was
+    /// created; it has nothing anyone chose yet. Read here, before the old item is removed: removing it
+    /// deletes the images it kept in Jellyfin's metadata folder. An image file that is gone (a sidecar
+    /// beside the media that the arr already moved to the new name) is skipped; the replacement finds
+    /// that one at its new name. DO NOT drop this for "the next refresh fetches images anyway": a fetch
+    /// brings the provider's image, never the one that was set.
+    /// </summary>
+    private async Task CopyImagesAsync(BaseItem old, BaseItem replacement, CancellationToken cancellationToken)
+    {
+        var copied = 0;
+        foreach (var group in old.ImageInfos.Where(i => i.IsLocalFile).GroupBy(i => i.Type))
+        {
+            var index = 0;
+            foreach (var image in group)
+            {
+                byte[] bytes;
+                try
+                {
+                    bytes = await File.ReadAllBytesAsync(image.Path, cancellationToken).ConfigureAwait(false);
+                }
+                catch (IOException)
+                {
+                    continue;   // gone or unreadable: nothing to carry
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    continue;
+                }
+
+                using var stream = new MemoryStream(bytes);
+                int? at = group.Key == ImageType.Backdrop ? index : null;
+                await _providerManager.SaveImage(replacement, stream, MimeTypes.GetMimeType(image.Path), group.Key, at, cancellationToken).ConfigureAwait(false);
+                index++;
+                copied++;
+            }
+        }
+
+        if (copied > 0)
+        {
+            await replacement.UpdateToRepositoryAsync(ItemUpdateType.ImageUpdate, cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("ArrRefresh: carried {Count} image(s) from {Old} to {New}", copied, old.Path, replacement.Path);
         }
     }
 
