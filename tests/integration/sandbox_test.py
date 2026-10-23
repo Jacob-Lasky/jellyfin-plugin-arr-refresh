@@ -15,6 +15,7 @@ covers. A run whose reaper also died is swept by a later run: at once when its p
 Assertions are on item types, paths, watch state and collection membership, never on names,
 because names come from TMDb/TVDb and the sandbox may or may not have network access.
 """
+import base64
 import hashlib
 import io
 import json
@@ -24,6 +25,7 @@ import select
 import signal
 import socket
 import sqlite3
+import struct
 import tempfile
 import zipfile
 import subprocess
@@ -33,6 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 
 IMAGE = "jellyfin/jellyfin:12.2.20261005-225228"  # the 12.2.0 release build; matches targetAbi
 # The search backend Tower runs: Meilisearch 1.12.8 and arnesacnussem's Meilisearch plugin 1.12.1.5,
@@ -251,6 +254,33 @@ def api(method, path, body=None, auth=True, expect=None):
     return status, (json.loads(raw) if raw[:1] in (b"{", b"[") else None)
 
 
+def png(rgb):
+    """A 2x2 PNG of one colour: a different image per item, so carried bytes say which item they came from."""
+    raw = b"".join(b"\x00" + bytes(rgb) * 2 for _ in range(2))
+    chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def set_image(item_id, data):
+    """Uploads a Primary image the way TitleCardMaker does (base64 body)."""
+    req = urllib.request.Request(base + "/Items/%s/Images/Primary" % item_id, data=base64.b64encode(data), method="POST")
+    req.add_header("Authorization", 'MediaBrowser Token="%s"' % token)
+    req.add_header("Content-Type", "image/png")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        assert r.status == 204, r.status
+
+
+def image_of(item_id):
+    """The item's Primary image as stored, or None."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(base + "/Items/%s/Images/Primary" % item_id,
+                                                           headers={"Authorization": 'MediaBrowser Token="%s"' % token}), timeout=60) as r:
+            return r.read()
+    except urllib.error.HTTPError:
+        return None
+
+
 def webhook(payload):
     return api("POST", "/ArrRefresh/Webhook", payload, expect=200)[1]
 
@@ -429,7 +459,10 @@ def setup(dll):
     wait_for("Meilisearch plugin connected", lambda: api("GET", "/meilisearch/reconnect", expect=200)[1]["meilisearchOk"], timeout=60)
     for name, ctype, path in [("Movies", "movies", MOVIES), ("TV", "tvshows", TV), ("Share", "movies", SHARE)]:
         api("POST", "/Library/VirtualFolders?name=%s&collectionType=%s&paths=%s&refreshLibrary=false" % (name, ctype, path),
-            {"LibraryOptions": {"EnableRealtimeMonitor": False, "PathInfos": [{"Path": path}]}}, expect=204)
+            # As on Tower since 2026-10-23 (homelab#200): Sonarr and Radarr are the only writers of sidecars
+            # beside the media, so Jellyfin keeps its images in its own metadata folder.
+            {"LibraryOptions": {"EnableRealtimeMonitor": False, "PathInfos": [{"Path": path}],
+                                "SaveLocalMetadata": False, "MetadataSavers": []}}, expect=204)
     api("POST", "/Library/VirtualFolders?name=Local&collectionType=movies&paths=%s&refreshLibrary=false" % LOCAL,
         {"LibraryOptions": {"EnableRealtimeMonitor": False, "PathInfos": [{"Path": LOCAL}], "EnableInternetProviders": False,
                             "TypeOptions": [{"Type": "Movie", "MetadataFetchers": [], "MetadataFetcherOrder": [], "ImageFetchers": [], "ImageFetcherOrder": []}]}},
@@ -473,6 +506,9 @@ def run():
 
     # Radarr rename: same folder, new file name. Watch state and the collection must follow.
     old, new = HEAT + "/Heat (1995) {tmdb-949} [Bluray-1080p].mkv", HEAT + "/Heat (1995) {tmdb-949} [Bluray-1080p][h264].mkv"
+    heat_img = png((200, 30, 30))   # a poster set on purpose (TitleCardMaker uploads its cards this way)
+    set_image(heat_id, heat_img)
+    check("an uploaded image is what the item serves (the instrument)", image_of(heat_id) == heat_img)
     ex('mv "%s" "%s"' % (old, new))
     webhook({"eventType": "Rename", "instanceName": "Radarr", "movie": {"folderPath": HEAT},
              "renamedMovieFiles": [{"path": new, "previousPath": old}]})
@@ -484,6 +520,13 @@ def run():
     check("rename: the old item's document was removed", wait_for("old document gone", lambda: meili_doc(heat_id) is None, timeout=60))
     check("rename: collection membership carried over",
           [i["Path"] for i in api("GET", "/Items?ParentId=%s&Fields=Path" % coll, expect=200)[1]["Items"]] == [new])
+    check("rename: the image set on the old item is the new item's (homelab#200)",
+          wait_for("image carried", lambda: image_of(renamed["Id"]) == heat_img, timeout=60))
+    time.sleep(10)   # the new item's queued metadata refresh runs meanwhile; it must not replace a carried image
+    check("rename: the carried image survives the new item's metadata refresh", image_of(renamed["Id"]) == heat_img)
+    folder = subprocess.run(["docker", "exec", NAME, "ls", "-A", HEAT], capture_output=True, text=True).stdout.split()
+    check("rename: nothing written beside the media (no .nfo or image; the arr owns sidecars)",
+          not [f for f in folder if f.endswith((".nfo", ".jpg", ".png", ".jpeg"))])
 
     # Radarr import of a new movie.
     dune = DUNE + "/Dune (2021) {tmdb-438631} [WEBDL-2160p].mkv"
@@ -555,6 +598,8 @@ def run():
     ids = {i["Path"]: i["Id"] for i in items("Episode")}
     api("POST", "/UserPlayedItems/%s?userId=%s" % (ids[e1_old], user_id), expect=200)
     playlist = api("POST", "/Playlists", {"Name": "Queue", "Ids": [ids[e1_old], ids[e2_old]], "UserId": user_id}, expect=200)[1]["Id"]
+    card = png((20, 60, 220))   # a title card on S01E01 only
+    set_image(ids[e1_old], card)
     ex('mv "%s" "%s" && mv "%s" "%s"' % (e1_old, e1_new, e2_old, e2_new))
     webhook({"eventType": "Rename", "instanceName": "Sonarr", "series": {"path": SEV},
              "renamedEpisodeFiles": [{"path": e1_new, "previousPath": e1_old}, {"path": e2_new, "previousPath": e2_old}]})
@@ -564,6 +609,10 @@ def run():
     check("episode rename: each episode keeps its own watch state", played[e1_new] and not played[e2_new])
     in_playlist = [i["Path"] for i in api("GET", "/Playlists/%s/Items?userId=%s&Fields=Path" % (playlist, user_id), expect=200)[1]["Items"]]
     check("episode rename: both playlist entries carried over, in order", in_playlist == [e1_new, e2_new])
+    new_ids = {i["Path"]: i["Id"] for i in items("Episode")}
+    check("episode rename: the title card stays with its episode",
+          wait_for("card carried", lambda: image_of(new_ids[e1_new]) == card, timeout=60))
+    check("episode rename: and never lands on the other episode", image_of(new_ids[e2_new]) != card)
     ex('rm "%s"' % e3)
     webhook({"eventType": "EpisodeFileDelete", "instanceName": "Sonarr", "series": {"path": SEV}, "episodeFile": {"path": e3}})
     check("episode file delete: removed", wait_for("episode delete visible", lambda: e3 not in paths_of("Episode")))
