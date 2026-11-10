@@ -3,6 +3,14 @@
     "guid": "89c19d1d-6a41-4cc3-aad3-d72b1d32039f",
     "versions": [
       {
+        "version": "1.4.1.0",
+        "changelog": "Fetch fresh XMLTV on every guide refresh.\n\nExpire configured XMLTV caches and reset Jellyfin's failed-download retry delay before hourly and manual guide refreshes. Preserve the previous guide as a fallback, isolate provider errors, and cover four newly published channels plus HTTP failure/recovery with real-server integration tests.",
+        "targetAbi": "12.2.0.0",
+        "sourceUrl": "https://github.com/Jacob-Lasky/jellyfin-plugin-arr-refresh/releases/download/v1.4.1.0/arr-refresh_1.4.1.0.zip",
+        "checksum": "f2f09900beec5c5c918af934ab28f2fa",
+        "timestamp": "2026-11-10T21:04:04Z"
+      },
+      {
         "version": "1.4.0.0",
         "changelog": "Merge pull request #4 from Jacob-Lasky/images-follow-the-item\n\nCarry an item's images to its replacement (1.4.0.0)",
         "targetAbi": "12.2.0.0",
