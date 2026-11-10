@@ -20,6 +20,16 @@ night of upgrades becomes a hundred of them.
 
 This plugin resolves each path the arr reports on its own and touches nothing else.
 
+## Live TV guide freshness
+
+Before each `RefreshGuide` task, Arr Refresh expires the cached XMLTV files for
+configured providers and resets the native failed-download retry delay. Jellyfin otherwise reuses an XMLTV download for one hour,
+including during a manual refresh, so channels newly added by a dynamic tuner can
+appear without programmes. Scheduled and manual guide refreshes now fetch the
+current XMLTV. Only XMLTV cache files whose names match configured provider IDs
+are invalidated; the previous guide remains available if the download fails.
+Channel/profile configuration and recordings are unaffected.
+
 ## What it does per event
 
 Every path in the payload is reconciled under its **nearest live library folder**: the episode's
