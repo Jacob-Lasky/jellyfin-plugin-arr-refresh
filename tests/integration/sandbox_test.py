@@ -140,9 +140,9 @@ def teardown(run, attempts=3):
     for attempt in range(attempts):
         if attempt:
             time.sleep(2 * attempt)
-        # By exact name, never by a filter: these three are everything a run creates (see setup). The labels
+        # By exact name, never by a filter: these are everything a run creates (see setup and guide test). Labels
         # only confirm that nothing is left, and let the sweep find runs.
-        subprocess.run(["docker", "rm", "-fv", run, run + "-meili"], capture_output=True)
+        subprocess.run(["docker", "rm", "-fv", run, run + "-meili", run + "-guide"], capture_output=True)
         subprocess.run(["docker", "network", "rm", run + "-net"], capture_output=True)  # after its endpoints
         containers, networks = docker_ids("container", run), docker_ids("network", run)
         if containers is None or networks is None:
@@ -407,7 +407,7 @@ def install_meilisearch_plugin():
     ex("cp -r /tmp/Meilisearch_1.12.1.5 /config/plugins/")
 
 
-def setup(dll):
+def setup(dll, guide_only=False):
     global base, token, user_id, meili
     # Meilisearch sizes its indexing memory from the host's RAM, not the container limit, and is OOM-killed
     # under a cap unless told otherwise (Tower sets MEILI_MAX_INDEXING_MEMORY for the same reason).
@@ -415,32 +415,39 @@ def setup(dll):
     # (inspect then shows MemorySwap -1 and `docker run` warns "Memory limited without swap"); on such a host
     # the swap cap has to come from the host itself, as Tower's memory-swap-cap script provides.
     sh("docker", "network", "create", *LABELS, NAME + "-net")
-    sh("docker", "run", "-d", "--name", NAME + "-meili", *LABELS, "--network", NAME + "-net", "--network-alias", "meili",
-       "--memory=2g", "--memory-swap=2g", "-e", "MEILI_MASTER_KEY=" + MEILI_KEY,
-       "-e", "MEILI_MAX_INDEXING_MEMORY=512MiB",
-       "-e", "MEILI_NO_ANALYTICS=true", "-e", "MEILI_HTTP_ADDR=0.0.0.0:7700", MEILI_IMAGE)
-    sh("docker", "network", "connect", "bridge", NAME + "-meili")
-    meili = meili_bridge_url()
-    wait_for("Meilisearch answers", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
+    if not guide_only:
+        sh("docker", "run", "-d", "--name", NAME + "-meili", *LABELS, "--network", NAME + "-net", "--network-alias", "meili",
+           "--memory=2g", "--memory-swap=2g", "-e", "MEILI_MASTER_KEY=" + MEILI_KEY,
+           "-e", "MEILI_MAX_INDEXING_MEMORY=512MiB",
+           "-e", "MEILI_NO_ANALYTICS=true", "-e", "MEILI_HTTP_ADDR=0.0.0.0:7700", MEILI_IMAGE)
+        sh("docker", "network", "connect", "bridge", NAME + "-meili")
+        meili = meili_bridge_url()
+        wait_for("Meilisearch answers", lambda: meili_api("GET", "/health")[0] == 200, timeout=60)
     sh("docker", "create", "--name", NAME, *LABELS, "--user", "99:100", "--memory=2g", "--memory-swap=2g", IMAGE)
     sh("docker", "network", "connect", NAME + "-net", NAME)
     sh("docker", "cp", dll, NAME + ":/tmp/plugin.dll")
     sh("docker", "start", NAME)
+    if guide_only:
+        # Full setup generates media before restart; the small guide case must also let first boot finish.
+        ip = sh("docker", "inspect", NAME, "--format", '{{(index .NetworkSettings.Networks "bridge").IPAddress}}')
+        base = "http://%s:8096" % ip
+        wait_for("initial server answers", lambda: _public_ok(), timeout=120)
     ex("mkdir -p /config/plugins/ArrRefresh_it && cp /tmp/plugin.dll /config/plugins/ArrRefresh_it/")
-    install_meilisearch_plugin()
-    sh("docker", "exec", "-u", "0", NAME, "sh", "-c", "mkdir -p %s %s %s %s && chown -R 99:100 /data" % (MOVIES, TV, SHARE, LOCAL))
-    for p in [HEAT + "/Heat (1995) {tmdb-949} [Bluray-1080p].mkv",
-              ALIEN + "/Alien (1979) {tmdb-348} [Bluray-1080p].mkv",
-              SEV + "/Season 01/Severance (2022) - S01E01 - Good News About Hell.mkv",
-              SEV + "/Season 01/Severance (2022) - S01E02 - Half Loop.mkv",
-              TERM + "/The Terminal (2004) {tmdb-594} [DVD].mkv",
-              UP + "/Up (2009) {tmdb-14160} - 1080p.mkv",
-              BRAZIL + "/Brazil (1985).mkv",
-              CLUE + "/Clue (1985).mkv",
-              ALIENS + "/Aliens (1986) {tmdb-679} [Bluray-1080p].mkv",
-              ALIENS + "/leftover.mkv",
-              LOCAL + "/Placeholder (2000)/Placeholder (2000).mkv"]:  # an empty library gets no root item
-        make_video(p)
+    if not guide_only:
+        install_meilisearch_plugin()
+        sh("docker", "exec", "-u", "0", NAME, "sh", "-c", "mkdir -p %s %s %s %s && chown -R 99:100 /data" % (MOVIES, TV, SHARE, LOCAL))
+        for p in [HEAT + "/Heat (1995) {tmdb-949} [Bluray-1080p].mkv",
+                  ALIEN + "/Alien (1979) {tmdb-348} [Bluray-1080p].mkv",
+                  SEV + "/Season 01/Severance (2022) - S01E01 - Good News About Hell.mkv",
+                  SEV + "/Season 01/Severance (2022) - S01E02 - Half Loop.mkv",
+                  TERM + "/The Terminal (2004) {tmdb-594} [DVD].mkv",
+                  UP + "/Up (2009) {tmdb-14160} - 1080p.mkv",
+                  BRAZIL + "/Brazil (1985).mkv",
+                  CLUE + "/Clue (1985).mkv",
+                  ALIENS + "/Aliens (1986) {tmdb-679} [Bluray-1080p].mkv",
+                  ALIENS + "/leftover.mkv",
+                  LOCAL + "/Placeholder (2000)/Placeholder (2000).mkv"]:  # an empty library gets no root item
+            make_video(p)
     sh("docker", "restart", "-t", "30", NAME)  # load the plugin copied in after the first start
     ip = sh("docker", "inspect", NAME, "--format", '{{(index .NetworkSettings.Networks "bridge").IPAddress}}')  # it is on two networks
     base = "http://%s:8096" % ip
@@ -453,6 +460,8 @@ def setup(dll):
     user_id = api("GET", "/Users", expect=200)[1][0]["Id"]
     plugins = {p["Name"]: p["Status"] for p in api("GET", "/Plugins", expect=200)[1]}
     check("plugin loaded and active", plugins.get("Arr Refresh") == "Active")
+    if guide_only:
+        return
     check("Meilisearch plugin loaded and active", plugins.get("Meilisearch") == "Active")
     api("POST", "/Plugins/%s/Configuration" % MEILI_PLUGIN_ID,
         {"ApiKey": MEILI_KEY, "Url": MEILI_URL_FOR_JELLYFIN, "Debug": False, "IndexName": MEILI_INDEX, "MatchingStrategy": "last"}, expect=204)
@@ -956,8 +965,11 @@ def main():
             raise SystemExit("the cleanup reaper did not start, so nothing was created")
         reaper.stdout.close()
         sweep_stale()
-        setup(dll)
-        run()
+        setup(dll, guide_only="--guide-only" in sys.argv[2:])
+        if "--guide-only" not in sys.argv[2:]:
+            run()
+        from guide_cache_test import run as run_guide
+        run_guide(NAME, base, token, LABELS)
     except Exception as e:
         failures.append("exception: %r" % e)
         raise

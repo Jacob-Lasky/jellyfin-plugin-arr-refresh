@@ -1,3 +1,4 @@
+using Jellyfin.Plugin.ArrRefresh.Guide;
 using Jellyfin.Plugin.ArrRefresh.Library;
 using Jellyfin.Plugin.ArrRefresh.Search;
 using MediaBrowser.Controller;
@@ -14,6 +15,8 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
     /// <inheritdoc />
     public void RegisterServices(IServiceCollection serviceCollection, IServerApplicationHost applicationHost)
     {
+        serviceCollection.AddHostedService<XmlTvGuideCache>();
+
         // Singleton: its gate serialises every webhook across requests.
         serviceCollection.AddSingleton<TargetedUpdater>();
 
