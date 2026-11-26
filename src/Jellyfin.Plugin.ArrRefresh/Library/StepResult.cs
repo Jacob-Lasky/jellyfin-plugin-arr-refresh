@@ -34,6 +34,9 @@ public static class StepActions
 
     /// <summary>The path was not acted on.</summary>
     public const string Skip = "Skip";
+
+    /// <summary>A delete event named a path the arr had not deleted yet; it is reconciled once it is gone.</summary>
+    public const string AwaitDelete = "AwaitDelete";
 }
 
 /// <summary>
@@ -46,6 +49,9 @@ public static class StepOutcomes
 
     /// <summary>The step was deliberately not applied.</summary>
     public const string Skipped = "skipped";
+
+    /// <summary>The step runs later, in the background; its result is logged, not returned.</summary>
+    public const string Deferred = "deferred";
 
     /// <summary>The step could not be applied; nothing was changed for it.</summary>
     public const string Error = "error";

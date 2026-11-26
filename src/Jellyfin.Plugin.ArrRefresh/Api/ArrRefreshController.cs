@@ -54,7 +54,8 @@ public class ArrRefreshController : ControllerBase
     /// Receives a stock Sonarr or Radarr "Webhook" connection payload and updates only the items it names.
     /// </summary>
     /// <param name="cancellationToken">The cancellation token.</param>
-    /// <response code="200">The event was applied, or was a test or an event that changes no files.</response>
+    /// <response code="200">The event was applied (paths a delete event names that are still on disk are
+    /// reconciled in the background: their steps have outcome <c>deferred</c>), or was a test or an event that changes no files.</response>
     /// <response code="400">The body is not a Sonarr/Radarr webhook.</response>
     /// <returns>What was done.</returns>
     [HttpPost("Webhook")]
@@ -87,7 +88,7 @@ public class ArrRefreshController : ControllerBase
             return new ArrRefreshResponse(evt.Kind == ArrEventKind.Test ? ResponseStatuses.TestOk : ResponseStatuses.Ignored, evt.Source.ToString(), evt.EventType, null, []);
         }
 
-        return await ApplyAsync(evt.Paths, evt.Replacements, context, evt.Source.ToString(), evt.EventType, cancellationToken).ConfigureAwait(false);
+        return await ApplyAsync(evt.Paths, evt.Replacements, context, evt.Source.ToString(), evt.EventType, cancellationToken, evt.DeletesFiles).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -103,7 +104,7 @@ public class ArrRefreshController : ControllerBase
     public Task<ActionResult<ArrRefreshResponse>> PostPaths([FromBody, Required] PathsRequest request, CancellationToken cancellationToken)
         => ApplyAsync((request.Paths ?? []).Concat((request.Replacements ?? []).SelectMany(r => new[] { r.Old, r.New })).Distinct(StringComparer.Ordinal).ToList(), request.Replacements ?? [], "manual", null, null, cancellationToken);
 
-    private async Task<ActionResult<ArrRefreshResponse>> ApplyAsync(IReadOnlyList<string> paths, IReadOnlyList<PathReplacement> replacements, string context, string? source, string? eventType, CancellationToken cancellationToken)
+    private async Task<ActionResult<ArrRefreshResponse>> ApplyAsync(IReadOnlyList<string> paths, IReadOnlyList<PathReplacement> replacements, string context, string? source, string? eventType, CancellationToken cancellationToken, bool deletesFiles = false)
     {
         PathMapper mapper;
         try
@@ -117,11 +118,24 @@ public class ArrRefreshController : ControllerBase
         }
 
         string Map(string p) => PathUtil.Normalize(p) is { } n ? mapper.Map(n) : p;
-        var results = await _updater.ApplyAsync(
-            paths.Select(Map).ToList(),
-            replacements.Select(r => r with { Old = Map(r.Old), New = Map(r.New) }).ToList(),
-            context,
-            cancellationToken).ConfigureAwait(false);
+        var (now, later) = PendingDeletion.Split(paths.Select(Map).ToList(), deletesFiles, JellyfinLibraryView.OnDisk);
+        var deferred = later
+            .Select(p => new StepResult(StepActions.AwaitDelete, p, StepOutcomes.Deferred, [], [], [], $"still on disk; reconciled once the arr has deleted it (at most {PendingDeletion.Limit.TotalMinutes} min)"))
+            .ToList();
+        if (later.Count > 0)
+        {
+            _logger.LogInformation("ArrRefresh [{Context}]: waiting for the arr to delete {Paths}", context, string.Join("; ", later));
+            _updater.ApplyWhenGone(later, context);
+        }
+
+        var results = now.Count == 0
+            ? []
+            : await _updater.ApplyAsync(
+                now,
+                replacements.Select(r => r with { Old = Map(r.Old), New = Map(r.New) }).ToList(),
+                context,
+                cancellationToken).ConfigureAwait(false);
+        results = results.Concat(deferred).ToList();
         var status = results.Any(r => r.Outcome == StepOutcomes.Error) ? ResponseStatuses.Partial : ResponseStatuses.Ok;
         return new ArrRefreshResponse(status, source, eventType, null, results);
     }
@@ -149,7 +163,7 @@ public sealed record ArrRefreshResponse(string Status, string? Source, string? E
 /// </summary>
 public static class ResponseStatuses
 {
-    /// <summary>Every step was applied or deliberately skipped.</summary>
+    /// <summary>Every step was applied, deliberately skipped, or deferred to the background (outcome <c>deferred</c>, whose result is only logged).</summary>
     public const string Ok = "ok";
 
     /// <summary>At least one step failed; the others were applied.</summary>

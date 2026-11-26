@@ -41,13 +41,17 @@ public enum ArrEventKind
 /// <param name="Kind">What to do with the event.</param>
 /// <param name="Paths">Every path the event added, removed or renamed (old and new), deduplicated, in payload order.</param>
 /// <param name="Replacements">The old-to-new file pairs the arr itself reports: a rename's previous and new path, an upgrade's replaced and imported file.</param>
+/// <param name="DeletesFiles">True when the event reports the arr deleting its paths from disk (a file delete, or a
+/// movie or series delete with <c>deletedFiles</c> set). The arr can send the webhook before the delete has
+/// happened, so a path still on disk is reconciled once it is gone (see <c>PendingDeletion</c>).</param>
 public sealed record ArrEvent(
     ArrSource Source,
     string EventType,
     string? InstanceName,
     ArrEventKind Kind,
     IReadOnlyList<string> Paths,
-    IReadOnlyList<PathReplacement> Replacements);
+    IReadOnlyList<PathReplacement> Replacements,
+    bool DeletesFiles = false);
 
 /// <summary>
 /// A file the arr replaced with another: the identity link between an old library item and its successor.
