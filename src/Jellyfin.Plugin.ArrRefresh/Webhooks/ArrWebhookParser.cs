@@ -65,7 +65,7 @@ public static class ArrWebhookParser
                 _ => ArrEventKind.Ignored,
             };
 
-            return new ArrEvent(source, eventType, instanceName, kind, Dedupe(paths), replacements.Distinct().ToList());
+            return new ArrEvent(source, eventType, instanceName, kind, Dedupe(paths), replacements.Distinct().ToList(), kind == ArrEventKind.Apply && DeletesFiles(root, eventType));
         }
     }
 
@@ -131,6 +131,18 @@ public static class ArrWebhookParser
                 return ArrEventKind.Ignored;
         }
     }
+
+    /// <summary>
+    /// Whether the event reports the arr deleting its paths from disk. A movie or series delete only
+    /// does when the user ticked "Delete files" (<c>deletedFiles</c>); without it the folder stays and
+    /// must be reconciled as it is.
+    /// </summary>
+    private static bool DeletesFiles(JsonElement root, string eventType) => eventType.ToUpperInvariant() switch
+    {
+        "MOVIEFILEDELETE" or "EPISODEFILEDELETE" => true,
+        "MOVIEDELETE" or "SERIESDELETE" => Get(root, "deletedFiles") is { ValueKind: JsonValueKind.True },
+        _ => false,
+    };
 
     private static JsonElement? Get(JsonElement obj, string name)
     {

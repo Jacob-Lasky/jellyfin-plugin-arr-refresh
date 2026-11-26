@@ -96,8 +96,10 @@ try:
     OWNER = "%s:%s" % (socket.gethostname(), process_identity(os.getpid()))
 except OSError:
     OWNER = socket.gethostname() + ":unknown"  # not Linux: only the age sweep can judge this run
+# dev.jakelasky.build-role=disposable: Tower's log sentinel reads an unlabelled container as a service, so
+# the errors this test provokes on purpose would page as service alerts when it runs there.
 LABELS = ["--label", RUN_LABEL + "=" + NAME, "--label", OWNER_LABEL + "=" + OWNER,
-          "--label", "%s=%d" % (CREATED_LABEL, time.time())]
+          "--label", "%s=%d" % (CREATED_LABEL, time.time()), "--label", "dev.jakelasky.build-role=disposable"]
 MOVIES, TV = "/data/media/movies", "/data/media/tv"
 HEAT = MOVIES + "/Heat (1995) {tmdb-949}"
 ALIEN = MOVIES + "/Alien (1979) {tmdb-348}"
@@ -586,6 +588,30 @@ def run():
     meili_api("POST", "/indexes/%s/documents?primaryKey=guid" % MEILI_INDEX, [gone_doc])
     wait_for("stale document present", lambda: meili_doc(dune_id) is not None, timeout=30)
     check("a document left behind for a deleted item is removed by verification", wait_for("stale document removed", lambda: meili_doc(dune_id) is None, timeout=240))
+
+    # Radarr sends MovieDelete before its recycle bin moves the folder away (JAKE-1169): the webhook
+    # names a folder still on disk. Reconciling then would keep the movie and probe a file about to
+    # vanish; the plugin must wait for the folder to go and then remove the movie.
+    hoot_dir = MOVIES + "/Hoot (2006) {tmdb-18276}"
+    hoot = hoot_dir + "/Hoot (2006) {tmdb-18276} [WEBDL-1080p].mkv"
+    make_video(hoot)
+    webhook({"eventType": "Download", "instanceName": "Radarr", "movie": {"folderPath": hoot_dir}, "movieFile": {"path": hoot}})
+    wait_for("hoot visible", lambda: hoot in paths_of("Movie"))
+    # Its import refresh must be done first, or that refresh's own probe could meet the deleted file.
+    wait_for("hoot probed", lambda: any(i["Path"] == hoot and i.get("RunTimeTicks") for i in items("Movie")), timeout=120)
+    steps = webhook({"eventType": "MovieDelete", "instanceName": "Radarr", "movie": {"folderPath": hoot_dir}, "deletedFiles": True})["Steps"]
+    check("delete sent before the folder is gone: deferred, nothing done yet",
+          [(s["Action"], s["Outcome"], s["Refreshed"]) for s in steps] == [("AwaitDelete", "deferred", [])])
+    time.sleep(5)
+    check("delete sent before the folder is gone: movie kept while the folder exists", hoot in paths_of("Movie"))
+    ex('rm -r "%s"' % hoot_dir)
+    check("delete sent before the folder is gone: removed once it is", wait_for("deferred delete visible", lambda: hoot not in paths_of("Movie"), timeout=30))
+    after = wait_for("deferred delete logged", lambda: [line for line in server_log().splitlines()
+                                                         if "MovieDelete (after the delete)" in line and hoot_dir in line], timeout=30) or []
+    check("delete sent before the folder is gone: reconciled once, removing the movie and refreshing nothing",
+          len(after) == 1 and "refresh queued -" in after[0] and "removed -" not in after[0])
+    check("delete sent before the folder is gone: no probe of the vanished file",
+          not [line for line in server_log().splitlines() if "Error in Probe Provider" in line and "Hoot" in line])
 
     # Sonarr import into an existing season, then a new season.
     e3 = SEV + "/Season 01/Severance (2022) - S01E03 - In Perpetuity.mkv"

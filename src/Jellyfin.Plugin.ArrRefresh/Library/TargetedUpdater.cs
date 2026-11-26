@@ -122,6 +122,44 @@ public sealed class TargetedUpdater : IDisposable
         }
     }
 
+    /// <summary>
+    /// Applies paths an arr is still deleting once they are gone from disk (or, for a delete that never
+    /// happens, after <see cref="PendingDeletion.Limit"/>), in the background so the arr's webhook call
+    /// returns at once. See <see cref="PendingDeletion"/> for why they must not be applied immediately.
+    /// </summary>
+    /// <param name="paths">The paths, as Jellyfin sees them.</param>
+    /// <param name="context">A label for logs (instance and event type).</param>
+    public void ApplyWhenGone(IReadOnlyList<string> paths, string context)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var deadline = DateTime.UtcNow + PendingDeletion.Limit;
+                while (paths.Any(OnDisk) && DateTime.UtcNow < deadline)
+                {
+                    await Task.Delay(PendingDeletion.Poll, _stopping.Token).ConfigureAwait(false);
+                }
+
+                var left = paths.Where(OnDisk).ToList();
+                if (left.Count > 0)
+                {
+                    _logger.LogWarning("ArrRefresh [{Context}]: still on disk {Minutes} min after the delete webhook, reconciling as it is: {Paths}", context, PendingDeletion.Limit.TotalMinutes, string.Join("; ", left));
+                }
+
+                await ApplyAsync(paths, [], context + " (after the delete)", _stopping.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_stopping.IsCancellationRequested)
+            {
+                // shutting down; the scheduled scan reconciles it
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "ArrRefresh [{Context}]: reconciling after the delete failed for {Paths}", context, string.Join("; ", paths));
+            }
+        });
+    }
+
     /// <inheritdoc />
     /// <remarks>
     /// The gate is not disposed: a webhook still running at shutdown releases it in its finally, and a

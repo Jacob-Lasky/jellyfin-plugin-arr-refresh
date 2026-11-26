@@ -70,6 +70,28 @@ public class ArrWebhookParserTests
     }
 
     [Theory]
+    [InlineData("radarr-moviedelete.json", true)]
+    [InlineData("sonarr-seriesdelete.json", true)]
+    [InlineData("radarr-moviefiledelete.json", true)]
+    [InlineData("sonarr-episodefiledelete.json", true)]
+    [InlineData("radarr-download-upgrade.json", false)]
+    [InlineData("radarr-rename.json", false)]
+    [InlineData("radarr-grab.json", false)]
+    public void Delete_events_report_that_the_arr_is_deleting_their_paths(string fixture, bool deletes)
+        => Assert.Equal(deletes, ParseFixture(fixture).DeletesFiles);
+
+    [Theory]
+    [InlineData("MovieDelete", "movie", "folderPath")]
+    [InlineData("SeriesDelete", "series", "path")]
+    public void A_delete_that_keeps_the_files_does_not_wait_for_them_to_go(string eventType, string key, string pathKey)
+    {
+        var json = $$"""{"{{key}}":{"{{pathKey}}":"{{Movies}}"},"deletedFiles":false,"eventType":"{{eventType}}"}""";
+        var e = ArrWebhookParser.Parse(json);
+        Assert.Equal(ArrEventKind.Apply, e.Kind);
+        Assert.False(e.DeletesFiles);
+    }
+
+    [Theory]
     [InlineData("radarr-test.json", ArrSource.Radarr, ArrEventKind.Test)]
     [InlineData("radarr-grab.json", ArrSource.Radarr, ArrEventKind.Ignored)]
     [InlineData("sonarr-health.json", ArrSource.Unknown, ArrEventKind.Ignored)]

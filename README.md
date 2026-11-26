@@ -44,10 +44,18 @@ database holds for it:
 | Rename (files) | The item at the old path is replaced by one at the new path |
 | Folder moved in the arr | Nothing: the arrs send no event for a move; reconcile it with `POST /ArrRefresh/Paths` (see [Limits](#limits)) |
 | File delete | The item whose file is gone is removed |
-| Movie / series delete | The items under that folder are removed |
+| Movie / series delete | The items under that folder are removed (with "Delete files" unticked, the folder stays and is reconciled as it is) |
 | An extra version dropped beside a movie | Recorded on the existing movie as another version |
 | A version that outranks the current primary (2160p beside 1080p) | Left for the scheduled scan, which promotes versions; files that are gone are still removed |
 | Test, Grab, Health, ... | Nothing; answers 200 |
+
+A delete event can arrive before the arr has deleted anything: Radarr sends MovieDelete before its
+recycle bin moves the movie folder away. Reconciling then would keep the movie and queue a refresh whose
+ffprobe fails on the vanished file. So a file, movie or series delete (with "Delete files") whose path is
+still on disk answers at once (status `ok`) with an `AwaitDelete` step, outcome `deferred`, and the path is reconciled
+in the background as soon as it is gone, checked every 2 seconds. A path still there after 2 minutes (a
+delete that failed, or a recycle bin on another filesystem still copying) is reconciled as it is
+and not checked again; the scheduled scan removes it once it is gone. Its result is logged as `ArrRefresh [<instance> <event> (after the delete)]`.
 
 When an item is replaced, its watch state, playlist entries, collection memberships and images move to
 the new item. Images include anything set on purpose, such as a TitleCardMaker title card: a rename's
